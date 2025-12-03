@@ -62,8 +62,8 @@ class AudioStreamThread(QThread):
         
         # Peak hold için
         self.peak_levels = np.zeros(num_channels)
-        self.peak_decay = 0.92  # Her frame'de %92'ye düş (daha hızlı düşme, ama hala smooth)
-        
+        self.peak_decay = 0.85  # VU METER SLIDER DÜŞÜŞ HIZI
+
         logger.info(f"AudioStreamThread initialized: {sample_rate}Hz, {num_channels}ch, buffer={buffer_size}, gain={gain}x")
     
     def run(self):
