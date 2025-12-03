@@ -1,0 +1,51 @@
+<?xml version='1.0' encoding='utf-8'?>
+<!--
+  UMA-16v2 Microphone Array Geometry
+  
+  Physical Layout: 132mm x 132mm, 42mm spacing, 4x4 grid
+  Coordinate System (Camera View - looking at camera):
+    - Origin: Center (camera position)
+    - +X: Right (from camera's perspective)
+    - +Y: Up
+    - +Z: Into scene (away from camera)
+  
+  Microphone Layout (Camera View - LEFT to RIGHT):
+  
+  Row 4 (y=+0.063m, TOP):    Mic9    Mic10   Mic7    Mic8
+  Row 3 (y=+0.021m):         Mic11   Mic12   Mic5    Mic6
+  Row 2 (y=-0.021m):         Mic13   Mic14   Mic3    Mic4
+  Row 1 (y=-0.063m, BOTTOM): Mic15   Mic16   Mic1    Mic2
+                            (LEFT)                   (RIGHT)
+  X positions:              -0.063  -0.021  +0.021  +0.063
+  
+  Corner Microphones:
+  - Top-Left: Mic9 (x=-0.063, y=+0.063)
+  - Top-Right: Mic8 (x=+0.063, y=+0.063)
+  - Bottom-Left: Mic15 (x=-0.063, y=-0.063)
+  - Bottom-Right: Mic2 (x=+0.063, y=-0.063)
+-->
+<MicGeom Name="MiniDSP UMA-16v2 Custom">
+  <!-- Top Row (y=+0.063m) - LEFT to RIGHT: Mic9, Mic10, Mic7, Mic8 -->
+  <pos Name="Mic9" x="-0.0630" y="0.0630" z="0.0000" />
+  <pos Name="Mic10" x="-0.0210" y="0.0630" z="0.0000" />
+  <pos Name="Mic7" x="0.0210" y="0.0630" z="0.0000" />
+  <pos Name="Mic8" x="0.0630" y="0.0630" z="0.0000" />
+  
+  <!-- Second Row (y=+0.021m) - LEFT to RIGHT: Mic11, Mic12, Mic5, Mic6 -->
+  <pos Name="Mic11" x="-0.0630" y="0.0210" z="0.0000" />
+  <pos Name="Mic12" x="-0.0210" y="0.0210" z="0.0000" />
+  <pos Name="Mic5" x="0.0210" y="0.0210" z="0.0000" />
+  <pos Name="Mic6" x="0.0630" y="0.0210" z="0.0000" />
+  
+  <!-- Third Row (y=-0.021m) - LEFT to RIGHT: Mic13, Mic14, Mic3, Mic4 -->
+  <pos Name="Mic13" x="-0.0630" y="-0.0210" z="0.0000" />
+  <pos Name="Mic14" x="-0.0210" y="-0.0210" z="0.0000" />
+  <pos Name="Mic3" x="0.0210" y="-0.0210" z="0.0000" />
+  <pos Name="Mic4" x="0.0630" y="-0.0210" z="0.0000" />
+  
+  <!-- Bottom Row (y=-0.063m) - LEFT to RIGHT: Mic15, Mic16, Mic1, Mic2 -->
+  <pos Name="Mic15" x="-0.0630" y="-0.0630" z="0.0000" />
+  <pos Name="Mic16" x="-0.0210" y="-0.0630" z="0.0000" />
+  <pos Name="Mic1" x="0.0210" y="-0.0630" z="0.0000" />
+  <pos Name="Mic2" x="0.0630" y="-0.0630" z="0.0000" />
+</MicGeom>

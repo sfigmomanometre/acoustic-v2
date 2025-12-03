@@ -1,0 +1,33 @@
+# Core Scientific Computing
+numpy>=1.21.0
+scipy>=1.7.0
+matplotlib>=3.4.0
+
+# Audio Processing
+sounddevice>=0.4.6
+soundfile>=0.11.0
+acoular>=24.0
+
+# Video Processing
+opencv-python>=4.5.0
+opencv-contrib-python>=4.5.0
+
+# Data Storage
+h5py>=3.6.0
+
+# Configuration
+pyyaml>=6.0
+
+# Development & Testing
+jupyter>=1.0.0
+notebook>=6.4.0
+pytest>=7.0.0
+pytest-cov>=3.0.0
+
+# Optional: Performance
+# numba>=0.56.0  # JIT compilation için
+# line_profiler>=3.5.0  # Profiling için
+
+# Optional: GUI (sonradan eklenecek)
+# PyQt5>=5.15.0
+# pyqtgraph>=0.12.0

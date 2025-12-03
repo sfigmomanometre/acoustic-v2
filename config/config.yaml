@@ -1,0 +1,132 @@
+# UMA-16 Akustik Kamera Sistemi - Konfigürasyon
+
+# ===== Ses Ayarları =====
+audio:
+  sample_rate: 48000          # Hz - UMA-16 desteklenen rate
+  channels: 16                # miniDSP UMA-16 kanal sayısı
+  chunk_size: 4096            # Samples per buffer (trade-off: latency vs stability)
+  device_name: "UMA-16"       # Cihaz ismi (substring match)
+  dtype: "float32"            # Veri tipi
+  
+  # Ön işleme
+  preprocessing:
+    enable: true
+    highpass_cutoff: 100      # Hz - Düşük frekans filtreleme
+    lowpass_cutoff: 10000     # Hz - Yüksek frekans filtreleme
+
+# ===== Mikrofon Geometrisi =====
+microphone:
+  geometry_file: "config/micgeom.xml"
+  array_type: "circular"      # UMA-16 dairesel dizi
+  radius: 0.044               # metre - UMA-16 yarıçapı
+  center: [0.0, 0.0, 0.0]     # Reference merkez nokta
+
+# ===== Beamforming Ayarları =====
+beamforming:
+  algorithm: "DAS"            # DAS, MVDR, MUSIC, CLEAN-SC
+  
+  # Frekans aralığı
+  frequency:
+    min: 500                  # Hz
+    max: 8000                 # Hz
+    bands: 3                  # Octave band sayısı (opsiyonel)
+  
+  # Hesaplama grid'i (odak noktaları)
+  grid:
+    type: "rectangular"       # rectangular, spherical
+    x_range: [-1.5, 1.5]      # metre
+    y_range: [-1.5, 1.5]      # metre  
+    z: 1.0                    # metre (sabit mesafe - kamera düzlemi)
+    resolution: 0.05          # metre (çözünürlük)
+    
+  # Algoritma parametreleri
+  params:
+    # DAS için
+    r_diag: false             # Diagonal removal
+    
+    # MVDR için (gelecekte)
+    # diagonal_loading: 0.01
+    
+    # MUSIC için (gelecekte)
+    # num_sources: 2
+
+# ===== Video Ayarları =====
+video:
+  enable: true
+  device_id: 0                # USB kamera ID (0 = default)
+  resolution:
+    width: 1920
+    height: 1080
+  fps: 30
+  
+  # Kamera kalibrasyonu (opsiyonel)
+  calibration:
+    enable: false
+    fov: 60                   # Derece - Field of view
+    position: [0.0, 0.0, 0.0] # Kameranın mikrofon dizisine göre pozisyonu
+
+# ===== Görselleştirme =====
+visualization:
+  # Akustik harita
+  colormap: "jet"             # jet, hot, viridis
+  dynamic_range: 15           # dB - Gösterilecek dinamik aralık
+  normalization: "auto"       # auto, fixed
+  
+  # Video overlay
+  overlay:
+    enable: true
+    alpha: 0.6                # Şeffaflık (0.0-1.0)
+    blend_mode: "additive"    # additive, multiply
+  
+  # Real-time display
+  update_rate: 10             # Hz - Görüntü güncelleme hızı
+  interpolation: "bilinear"   # none, bilinear, bicubic
+
+# ===== Veri Saklama =====
+storage:
+  enable_recording: false
+  output_dir: "data/recordings"
+  format: "hdf5"              # hdf5, wav
+  
+  # Metadata
+  save_metadata: true
+  metadata_fields:
+    - timestamp
+    - config
+    - geometry
+
+# ===== Performans =====
+performance:
+  use_multiprocessing: false  # Multi-core kullanımı
+  num_workers: 4              # İşlemci sayısı
+  use_gpu: false              # GPU hızlandırma (gelecekte)
+  
+  # Memory management
+  buffer_size: 10             # Saniye cinsinden buffer
+  cache_results: true
+
+# ===== Debug & Logging =====
+debug:
+  verbose: true
+  log_level: "INFO"           # DEBUG, INFO, WARNING, ERROR
+  log_file: "acoustic_camera.log"
+  show_timing: true           # İşlem sürelerini göster
+  plot_intermediate: false    # Ara sonuçları görselleştir
+
+# ===== Kalibrasyon =====
+calibration:
+  # Mikrofon hassasiyet kalibrasyonu
+  mic_sensitivity:
+    enable: false
+    reference_file: "data/calibration/sensitivity.txt"
+  
+  # Faz kalibrasyonu
+  phase_calibration:
+    enable: false
+    reference_file: "data/calibration/phase.txt"
+  
+  # Ortam kompensasyonu
+  environment:
+    temperature: 20           # Celsius
+    pressure: 101325          # Pascal
+    humidity: 50              # %
