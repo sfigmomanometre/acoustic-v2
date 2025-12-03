@@ -69,8 +69,7 @@ class DoubleRangeSlider(QWidget):
         painter.drawEllipse(QPoint(high_pos, track_y),
                            self._handle_radius, self._handle_radius)
         
-        # Değer yazıları - daha görünür
-        painter.setPen(QColor(220, 220, 220))  # Açık gri/beyaz
+        # Değer yazıları - kontur ile daha görünür
         font = QFont()
         font.setPointSize(10)
         font.setBold(True)
@@ -79,12 +78,31 @@ class DoubleRangeSlider(QWidget):
         low_text = str(self._low)
         high_text = str(self._high)
         
-        # Sol kol değeri (üstte)
-        painter.drawText(QRect(low_pos - 40, 2, 80, 18), 
-                        Qt.AlignCenter, low_text)
-        # Sağ kol değeri (altta)
-        painter.drawText(QRect(high_pos - 40, height - 20, 80, 18),
-                        Qt.AlignCenter, high_text)
+        # Sol kol değeri (üstte) - kontur + beyaz yazı
+        low_rect = QRect(low_pos - 40, 2, 80, 18)
+        # Siyah kontur (outline)
+        painter.setPen(QPen(QColor(0, 0, 0), 2))
+        for dx in [-1, 0, 1]:
+            for dy in [-1, 0, 1]:
+                if dx != 0 or dy != 0:
+                    painter.drawText(low_rect.adjusted(dx, dy, dx, dy), 
+                                    Qt.AlignCenter, low_text)
+        # Beyaz yazı
+        painter.setPen(QColor(255, 255, 255))
+        painter.drawText(low_rect, Qt.AlignCenter, low_text)
+        
+        # Sağ kol değeri (altta) - kontur + beyaz yazı
+        high_rect = QRect(high_pos - 40, height - 20, 80, 18)
+        # Siyah kontur
+        painter.setPen(QPen(QColor(0, 0, 0), 2))
+        for dx in [-1, 0, 1]:
+            for dy in [-1, 0, 1]:
+                if dx != 0 or dy != 0:
+                    painter.drawText(high_rect.adjusted(dx, dy, dx, dy), 
+                                    Qt.AlignCenter, high_text)
+        # Beyaz yazı
+        painter.setPen(QColor(255, 255, 255))
+        painter.drawText(high_rect, Qt.AlignCenter, high_text)
     
     def mousePressEvent(self, event):
         """Mouse basıldığında"""

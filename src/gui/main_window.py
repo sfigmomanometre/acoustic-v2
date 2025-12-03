@@ -42,6 +42,7 @@ import numpy as np
 import cv2
 
 from .custom_widgets import DoubleRangeSlider
+from .visualization_widgets import SpectrogramWidget, WaveformWidget
 
 # Audio stream thread import
 import sys
@@ -83,6 +84,14 @@ class AcousticCameraGUI(QMainWindow):
         
         # Audio stream thread
         self.audio_thread = None
+        
+        # Visualization widgets
+        self.spectrogram_widget = None
+        self.waveform_widget = None
+        
+        # Visualization throttle (performans için)
+        self.viz_update_counter = 0
+        self.viz_update_interval = 3  # Her 3 callback'te bir güncelle
         
         # GUI bileşenlerini oluştur
         self._init_ui()
@@ -139,9 +148,9 @@ class AcousticCameraGUI(QMainWindow):
         audio_group = self._create_audio_group()
         layout.addWidget(audio_group)
         
-        # 3. BEAMFORMING + GÖRSELLEŞTİRME (BİRLEŞTİRİLDİ)
-        beamform_group = self._create_beamforming_visualization_group()
-        layout.addWidget(beamform_group)
+        # 3. PARAMETRELER & ALGORİTMALAR (Beamforming + Görselleştirme birleştirildi)
+        params_group = self._create_parameters_algorithms_group()
+        layout.addWidget(params_group)
         
         # 4. KAYIT & DOSYA YÜKLEME
         file_group = self._create_file_operations_group()
@@ -247,10 +256,28 @@ class AcousticCameraGUI(QMainWindow):
         group.setLayout(layout)
         return group
     
-    def _create_beamforming_visualization_group(self) -> QGroupBox:
-        """Beamforming + Görselleştirme ayarları (birleştirildi)"""
-        group = QGroupBox("🎯 Beamforming & Görselleştirme")
+    def _create_parameters_algorithms_group(self) -> QGroupBox:
+        """Parametreler & Algoritmalar - Beamforming + Görselleştirme birleştirildi"""
+        group = QGroupBox("⚙️ Parametreler & Algoritmalar")
         layout = QVBoxLayout()
+        
+        # --- GÖRSELLEŞTİRME AÇMA/KAPAMA ---
+        layout.addWidget(QLabel("<b>Görselleştirme Kontrol:</b>"))
+        
+        viz_control_layout = QVBoxLayout()
+        self.enable_spectrogram_check = QCheckBox("✓ Spektrogram Aktif")
+        self.enable_spectrogram_check.setChecked(True)
+        self.enable_spectrogram_check.setToolTip("Spektrogramı aç/kapat (CPU tasarrufu)")
+        viz_control_layout.addWidget(self.enable_spectrogram_check)
+        
+        self.enable_fft_check = QCheckBox("✓ FFT Spektrum Aktif")
+        self.enable_fft_check.setChecked(True)
+        self.enable_fft_check.setToolTip("FFT spektrumunu aç/kapat (CPU tasarrufu)")
+        viz_control_layout.addWidget(self.enable_fft_check)
+        
+        layout.addLayout(viz_control_layout)
+        
+        layout.addWidget(QLabel("─" * 30))
         
         # Algoritma seçimi
         layout.addWidget(QLabel("Algoritma:"))
@@ -407,26 +434,22 @@ class AcousticCameraGUI(QMainWindow):
         # Alt kısım: Spektrogram + Waveform
         analysis_splitter = QSplitter(Qt.Horizontal)
         
-        # Spektrogram
+        # Spektrogram - Real-time widget
         spectrogram_group = QGroupBox("📊 Spektrogram (Frekans-Zaman)")
         spec_layout = QVBoxLayout()
-        self.spectrogram_label = QLabel()
-        self.spectrogram_label.setMinimumSize(400, 150)
-        self.spectrogram_label.setStyleSheet("QLabel { background-color: black; }")
-        self.spectrogram_label.setText("Spektrogram buraya gelecek")
-        self.spectrogram_label.setAlignment(Qt.AlignCenter)
-        spec_layout.addWidget(self.spectrogram_label)
+        spec_layout.setContentsMargins(2, 2, 2, 2)
+        self.spectrogram_widget = SpectrogramWidget(sample_rate=48000, window_duration=5.0)
+        self.spectrogram_widget.setMinimumSize(400, 200)
+        spec_layout.addWidget(self.spectrogram_widget)
         spectrogram_group.setLayout(spec_layout)
         
-        # Waveform
-        waveform_group = QGroupBox("📈 Audio Waveform (Frekans-Şiddet)")
+        # Waveform - Real-time widget
+        waveform_group = QGroupBox("📈 FFT Spektrum (Frekans-Genlik)")
         wave_layout = QVBoxLayout()
-        self.waveform_label = QLabel()
-        self.waveform_label.setMinimumSize(400, 150)
-        self.waveform_label.setStyleSheet("QLabel { background-color: black; }")
-        self.waveform_label.setText("Waveform buraya gelecek")
-        self.waveform_label.setAlignment(Qt.AlignCenter)
-        wave_layout.addWidget(self.waveform_label)
+        wave_layout.setContentsMargins(2, 2, 2, 2)
+        self.waveform_widget = WaveformWidget(sample_rate=48000, fft_size=2048)
+        self.waveform_widget.setMinimumSize(400, 200)
+        wave_layout.addWidget(self.waveform_widget)
         waveform_group.setLayout(wave_layout)
         
         analysis_splitter.addWidget(spectrogram_group)
@@ -874,6 +897,7 @@ class AcousticCameraGUI(QMainWindow):
             
             # Sinyalleri bağla
             self.audio_thread.channelLevelsReady.connect(self._update_vu_meters)
+            self.audio_thread.audioDataReady.connect(self._update_visualizations)
             self.audio_thread.errorOccurred.connect(self._on_audio_error)
             
             # Thread'i başlat
@@ -899,6 +923,12 @@ class AcousticCameraGUI(QMainWindow):
             # VU meter'ları sıfırla
             for meter in self.vu_meters:
                 meter.setValue(0)
+            
+            # Visualization widget'ları temizle
+            if self.spectrogram_widget is not None:
+                self.spectrogram_widget.clear()
+            if self.waveform_widget is not None:
+                self.waveform_widget.clear()
     
     def _update_vu_meters(self, levels: list):
         """
@@ -917,6 +947,40 @@ class AcousticCameraGUI(QMainWindow):
         """Audio stream hata mesajı"""
         logger.error(f"Audio error: {error_msg}")
         self.audio_status_label.setText("🔴 Audio: Hata")
+    
+    def _update_visualizations(self, audio_data: np.ndarray, sample_rate: int):
+        """
+        Visualization widget'ları güncelle (throttled, checkbox kontrolü ile)
+        
+        Args:
+            audio_data: (num_samples, num_channels) numpy array - yeni gelen chunk
+            sample_rate: Örnekleme hızı
+        """
+        try:
+            # Throttle - her N callback'te bir güncelle (performans)
+            self.viz_update_counter += 1
+            if self.viz_update_counter < self.viz_update_interval:
+                return
+            self.viz_update_counter = 0
+            
+            # Spektrogram güncelle (checkbox aktif ise)
+            if (self.enable_spectrogram_check.isChecked() and 
+                self.spectrogram_widget is not None and 
+                self.audio_thread is not None):
+                buffer_data = self.audio_thread.get_buffer_data(duration=5.0)
+                if buffer_data is not None and len(buffer_data) > 0:
+                    self.spectrogram_widget.update_data(buffer_data)
+            
+            # FFT Spektrum güncelle (checkbox aktif ise)
+            if (self.enable_fft_check.isChecked() and 
+                self.waveform_widget is not None and 
+                self.audio_thread is not None):
+                buffer_data = self.audio_thread.get_buffer_data(duration=0.2)  # 0.2 saniye yeterli FFT için
+                if buffer_data is not None and len(buffer_data) > 0:
+                    self.waveform_widget.update_data(buffer_data)
+        
+        except Exception as e:
+            logger.error(f"Visualization update error: {e}")
     
     def toggle_recording(self):
         """Kayıt toggle"""
