@@ -12,13 +12,15 @@ miniDSP UMA-16 mikrofon dizisi ve USB kamera kullanarak gerçek zamanlı akustik
 ## 🎯 Proje Hedefleri
 
 - ✅ Mikrofon dizisi geometrisi tanımlama (XML parser)
-- [ ] Real-time ses verisi toplama (miniDSP UMA-16)
-- [ ] Beamforming algoritmaları (DAS, MVDR, MUSIC)
-- [ ] Akustik harita oluşturma ve görselleştirme
-- [ ] USB kamera entegrasyonu
-- [ ] Video-akustik overlay
-- [ ] GUI arayüzü (PyQt5/Tkinter)
-- [ ] Performans optimizasyonu
+- ✅ Real-time ses verisi toplama (miniDSP UMA-16)
+- ✅ Beamforming algoritmaları (DAS implementasyonu)
+- ✅ Akustik harita oluşturma ve görselleştirme
+- ✅ USB kamera entegrasyonu
+- ✅ Video-akustik overlay (Full-screen mapping)
+- ✅ GUI arayüzü (PySide6/Qt6)
+- ⚠️ Performans optimizasyonu (devam ediyor)
+- [ ] Kamera kalibrasyonu (perspektif düzeltme)
+- [ ] MVDR, MUSIC algoritmaları
 
 ## 🔧 Donanım
 

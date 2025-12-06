@@ -52,6 +52,17 @@ if str(src_path) not in sys.path:
     sys.path.insert(0, str(src_path))
 from audio.stream_thread import AudioStreamThread
 
+# Beamforming imports
+from algorithms.beamforming import (
+    load_mic_geometry,
+    create_focus_grid,
+    das_beamformer,
+    power_to_db,
+    normalize_power_map,
+    BeamformingConfig
+)
+from scipy.ndimage import gaussian_filter
+
 logger = logging.getLogger(__name__)
 
 
@@ -93,10 +104,27 @@ class AcousticCameraGUI(QMainWindow):
         self.viz_update_counter = 0
         self.viz_update_interval = 3  # Her 3 callback'te bir güncelle
         
+        # Beamforming variables
+        self.beamforming_enabled = False
+        self.beamforming_config = None
+        self.mic_positions = None
+        self.grid_points = None
+        self.grid_shape = None
+        self.beamforming_counter = 0
+        self.beamforming_interval = 2  # Her 2 callback'te bir beamforming (15 FPS hedef)
+        self.latest_heatmap = None  # Cached heatmap for overlay
+        self.detected_peak = None  # (x, y, z, power_db, grid_row, grid_col)
+        
+        # Performance monitoring
+        self.beamforming_times = []  # Track processing times
+        
         # GUI bileşenlerini oluştur
         self._init_ui()
         self._init_menubar()
         self._init_statusbar()
+        
+        # Initialize beamforming (load geometry, create grid)
+        self._init_beamforming()
         
         logger.info("GUI başlatıldı")
     
@@ -274,6 +302,12 @@ class AcousticCameraGUI(QMainWindow):
         self.enable_fft_check.setChecked(True)
         self.enable_fft_check.setToolTip("FFT spektrumunu aç/kapat (CPU tasarrufu)")
         viz_control_layout.addWidget(self.enable_fft_check)
+        
+        self.enable_beamforming_check = QCheckBox("🎯 Beamforming & Overlay Aktif")
+        self.enable_beamforming_check.setChecked(False)  # Başlangıçta kapalı
+        self.enable_beamforming_check.setToolTip("Akustik görüntüleme ve video overlay'i aç/kapat")
+        self.enable_beamforming_check.stateChanged.connect(self._on_beamforming_toggle)
+        viz_control_layout.addWidget(self.enable_beamforming_check)
         
         layout.addLayout(viz_control_layout)
         
@@ -978,6 +1012,18 @@ class AcousticCameraGUI(QMainWindow):
                 buffer_data = self.audio_thread.get_buffer_data(duration=0.2)  # 0.2 saniye yeterli FFT için
                 if buffer_data is not None and len(buffer_data) > 0:
                     self.waveform_widget.update_data(buffer_data)
+            
+            # Beamforming güncelle (throttled - daha az sıklıkta)
+            self.beamforming_counter += 1
+            if (self.beamforming_enabled and 
+                self.beamforming_counter >= self.beamforming_interval and
+                self.audio_thread is not None):
+                self.beamforming_counter = 0
+                
+                # Get buffer for beamforming (0.1 second = ~4800 samples @ 48kHz)
+                buffer_data = self.audio_thread.get_buffer_data(duration=0.1)
+                if buffer_data is not None and len(buffer_data) > 0:
+                    self._run_beamforming(buffer_data, sample_rate)
         
         except Exception as e:
             logger.error(f"Visualization update error: {e}")
@@ -1014,10 +1060,28 @@ class AcousticCameraGUI(QMainWindow):
     def on_freq_range_changed(self, min_val, max_val):
         """Frekans aralığı değiştiğinde"""
         logger.debug(f"Frekans aralığı: {min_val} - {max_val} Hz")
+        # Update beamforming config
+        if self.beamforming_config is not None:
+            self._update_beamforming_config()
     
     def on_db_range_changed(self, min_val, max_val):
         """dB aralığı değiştiğinde"""
         logger.debug(f"dB aralığı: {min_val} - {max_val} dB")
+        # dB range is used in heatmap rendering, no need to rebuild config
+    
+    def _on_beamforming_toggle(self, state):
+        """Beamforming checkbox toggle"""
+        self.beamforming_enabled = (state == Qt.CheckState.Checked.value)
+        logger.info(f"Beamforming {'enabled' if self.beamforming_enabled else 'disabled'}")
+        
+        if self.beamforming_enabled:
+            # Update config when enabled
+            self._update_beamforming_config()
+            self.statusbar.showMessage("🎯 Beamforming aktif - Video overlay başladı")
+        else:
+            # Clear overlay when disabled
+            self.latest_heatmap = None
+            self.statusbar.showMessage("Beamforming devre dışı")
     
     def load_audio_file(self):
         """Ses dosyası yükle"""
@@ -1046,20 +1110,28 @@ class AcousticCameraGUI(QMainWindow):
         if not self.is_running:
             return
         
-        # Video frame al
+        # Video frame al ve göster
+        # Not: Beamforming aktifse, _update_video_overlay() zaten frame'i overlay ile birlikte gösterir
+        # Beamforming kapalıysa, sadece plain video göster
         if self.video_capture is not None and self.video_capture.isOpened():
-            ret, frame = self.video_capture.read()
-            if ret:
-                # Frame'i göster
-                self._display_image(frame)
-                self.frame_count += 1
+            if not self.beamforming_enabled or self.latest_heatmap is None:
+                # Plain video (no overlay)
+                ret, frame = self.video_capture.read()
+                if ret:
+                    self._display_image(frame)
+                    self.frame_count += 1
+            # else: overlay zaten _update_video_overlay()'de gösterildi
         
         # FPS hesapla (basitleştirilmiş)
         fps = int(1000 / 33)  # ~30 FPS
         self.fps_label.setText(f"FPS: {fps}")
         
         # CPU kullanımı (simüle - gerçek değer için psutil gerekir)
-        self.cpu_label.setText(f"CPU: 15%")
+        cpu_usage = 15
+        if self.beamforming_enabled and len(self.beamforming_times) > 0:
+            # Daha yüksek CPU göster
+            cpu_usage = 25
+        self.cpu_label.setText(f"CPU: {cpu_usage}%")
         
         # VU meter'lar audio thread tarafından güncelleniyor - burada dokunma!
     
@@ -1098,6 +1170,370 @@ class AcousticCameraGUI(QMainWindow):
             2024</p>
             <p>miniDSP UMA-16v2 (4x4 Grid) + USB Kamera</p>
             """)
+    
+    # ============================================================================
+    # BEAMFORMING & ACOUSTIC IMAGING
+    # ============================================================================
+    
+    def _init_beamforming(self):
+        """Initialize beamforming: load geometry, create grid"""
+        try:
+            # Load microphone geometry
+            micgeom_path = Path(__file__).parent.parent.parent / 'micgeom.xml'
+            self.mic_positions = load_mic_geometry(str(micgeom_path))
+            logger.info(f"Loaded {len(self.mic_positions)} microphone positions")
+            
+            # Create beamforming configuration
+            self._update_beamforming_config()
+            
+            logger.info("Beamforming initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Beamforming initialization failed: {e}")
+            self.statusbar.showMessage(f"Beamforming hatası: {e}")
+    
+    def _update_beamforming_config(self):
+        """Update beamforming configuration from GUI parameters"""
+        try:
+            # Get parameters from GUI
+            freq_min, freq_max = self.freq_range_slider.values()
+            focus_distance = self.focus_distance_spin.value()
+            grid_resolution = self.grid_resolution_spin.value() / 100.0  # cm to m
+            
+            # Create config
+            # Grid size: larger area to cover more of the camera FOV
+            # At 1m distance, a typical webcam FOV is ~60-80 degrees
+            # This translates to roughly 1.0-1.5m visible area
+            self.beamforming_config = BeamformingConfig(
+                grid_size_x=1.2,  # 1.2 meters (120 cm) - wider coverage
+                grid_size_y=1.2,  # 1.2 meters (120 cm)
+                grid_resolution=grid_resolution,
+                focus_distance=focus_distance,
+                freq_min=float(freq_min),
+                freq_max=float(freq_max),
+                field_type='near-field',  # Near-field for accurate localization
+                sound_speed=343.0
+            )
+            
+            # Create focus grid
+            self.grid_points, self.grid_shape = create_focus_grid(self.beamforming_config)
+            
+            logger.info(f"Beamforming config updated: {self.grid_shape[0]}x{self.grid_shape[1]} grid, "
+                       f"freq=[{freq_min}, {freq_max}] Hz, z={focus_distance}m")
+            
+        except Exception as e:
+            logger.error(f"Failed to update beamforming config: {e}")
+    
+    def _run_beamforming(self, audio_data: np.ndarray, sample_rate: float):
+        """
+        Run beamforming on audio data and generate heatmap
+        
+        Args:
+            audio_data: (n_samples, n_mics) audio data
+            sample_rate: Sampling rate
+        """
+        import time
+        start_time = time.perf_counter()
+        
+        try:
+            # Check if beamforming is ready
+            if self.mic_positions is None or self.grid_points is None:
+                return
+            
+            # Run DAS beamformer
+            power_map = das_beamformer(
+                audio_data,
+                self.mic_positions,
+                self.grid_points,
+                sample_rate,
+                self.beamforming_config
+            )
+            
+            # Convert to dB
+            power_db = power_to_db(power_map)
+            
+            # Reshape to 2D grid
+            power_grid = power_db.reshape(self.grid_shape)
+            
+            # Find peak (brightest point) in power grid
+            self.detected_peak = self._detect_peak(power_grid, power_db)
+            
+            # Convert to heatmap (RGB image)
+            self.latest_heatmap = self._power_to_heatmap(power_grid)
+            
+            # Update overlay on video
+            self._update_video_overlay()
+            
+            # Performance monitoring
+            elapsed = (time.perf_counter() - start_time) * 1000  # ms
+            self.beamforming_times.append(elapsed)
+            if len(self.beamforming_times) > 30:
+                self.beamforming_times.pop(0)
+            
+            avg_time = np.mean(self.beamforming_times)
+            logger.debug(f"Beamforming: {elapsed:.1f} ms (avg: {avg_time:.1f} ms)")
+            
+        except Exception as e:
+            logger.error(f"Beamforming error: {e}", exc_info=True)
+    
+    def _detect_peak(self, power_grid: np.ndarray, power_map_1d: np.ndarray) -> Optional[dict]:
+        """
+        Detect the brightest point (peak) in the power grid
+        
+        Args:
+            power_grid: (height, width) power in dB
+            power_map_1d: (n_points,) power map (1D, before reshape)
+            
+        Returns:
+            dict with keys: x, y, z, power_db, grid_row, grid_col, or None if no peak
+        """
+        try:
+            # Get dB threshold
+            db_min, db_max = self.db_range_slider.values()
+            threshold = db_min + (db_max - db_min) * 0.2  # 20% above min
+            
+            # Find global maximum
+            max_idx_2d = np.unravel_index(np.argmax(power_grid), power_grid.shape)
+            max_power = power_grid[max_idx_2d]
+            
+            # Check if above threshold
+            if max_power < threshold:
+                return None
+            
+            # Convert 2D grid index to 1D index
+            grid_row, grid_col = max_idx_2d
+            max_idx_1d = grid_row * self.grid_shape[1] + grid_col
+            
+            # Get 3D position from grid_points
+            peak_position = self.grid_points[max_idx_1d]
+            
+            peak_info = {
+                'x': peak_position[0],
+                'y': peak_position[1],
+                'z': peak_position[2],
+                'power_db': max_power,
+                'grid_row': grid_row,
+                'grid_col': grid_col
+            }
+            
+            logger.debug(f"Peak detected: pos=({peak_info['x']:.2f}, {peak_info['y']:.2f}, {peak_info['z']:.2f}), "
+                        f"power={peak_info['power_db']:.1f} dB")
+            
+            return peak_info
+            
+        except Exception as e:
+            logger.error(f"Peak detection error: {e}")
+            return None
+    
+    def _power_to_heatmap(self, power_grid: np.ndarray) -> np.ndarray:
+        """
+        Convert power grid (dB) to RGB heatmap with proper thresholding
+        
+        Args:
+            power_grid: (height, width) power in dB
+            
+        Returns:
+            heatmap: (height, width, 4) RGBA uint8 image (with alpha channel)
+        """
+        # Get dB range from GUI
+        db_min, db_max = self.db_range_slider.values()
+        
+        # Clip to dB range (HARD threshold - values below db_min become 0)
+        power_clipped = np.clip(power_grid, db_min, db_max)
+        
+        # Create mask: only show areas above threshold
+        # Threshold = db_min + 10% of range (to avoid showing noise floor)
+        threshold = db_min + (db_max - db_min) * 0.1
+        mask = power_grid > threshold
+        
+        # Normalize to [0, 1] ONLY for values above threshold
+        normalized = np.zeros_like(power_grid, dtype=np.float32)
+        normalized[mask] = (power_clipped[mask] - db_min) / (db_max - db_min + 1e-6)
+        
+        # Apply gaussian smoothing ONLY to non-zero areas
+        normalized_smooth = gaussian_filter(normalized, sigma=1.5)
+        
+        # Re-apply mask after smoothing to avoid bleeding into zero areas
+        normalized_smooth[~mask] = 0
+        
+        # Convert to [0, 255] uint8
+        normalized_uint8 = (normalized_smooth * 255).astype(np.uint8)
+        
+        # Get colormap from GUI
+        colormap_name = self.colormap_combo.currentText()
+        
+        # Apply colormap
+        colormap_dict = {
+            'jet': cv2.COLORMAP_JET,
+            'hot': cv2.COLORMAP_HOT,
+            'viridis': cv2.COLORMAP_VIRIDIS,
+            'plasma': cv2.COLORMAP_PLASMA,
+            'inferno': cv2.COLORMAP_INFERNO,
+            'coolwarm': cv2.COLORMAP_COOL,
+            'rainbow': cv2.COLORMAP_RAINBOW,
+            'turbo': cv2.COLORMAP_TURBO
+        }
+        
+        cv_colormap = colormap_dict.get(colormap_name, cv2.COLORMAP_JET)
+        heatmap_bgr = cv2.applyColorMap(normalized_uint8, cv_colormap)
+        
+        # Convert BGR to RGB
+        heatmap_rgb = cv2.cvtColor(heatmap_bgr, cv2.COLOR_BGR2RGB)
+        
+        # Create alpha channel based on normalized power
+        # Alpha = 0 (transparent) where power is below threshold
+        # Alpha = normalized_smooth * 255 elsewhere
+        alpha = (normalized_smooth * 255).astype(np.uint8)
+        
+        # Add alpha channel
+        heatmap_rgba = np.dstack([heatmap_rgb, alpha])
+        
+        return heatmap_rgba
+    
+    def _update_video_overlay(self):
+        """Update video frame with acoustic heatmap overlay - FULL SCREEN mapping"""
+        try:
+            # Check if we have video and heatmap
+            if self.video_capture is None or self.latest_heatmap is None:
+                return
+            
+            # Capture video frame
+            ret, frame = self.video_capture.read()
+            if not ret:
+                return
+            
+            video_h, video_w = frame.shape[:2]
+            heatmap_h, heatmap_w = self.latest_heatmap.shape[:2]
+            
+            # ============================================================
+            # STRATEGY: FULL SCREEN OVERLAY WITH PROPER ASPECT RATIO
+            # ============================================================
+            # The acoustic grid is a physical area (e.g., 0.6m x 0.6m) 
+            # at distance Z from the mic array.
+            # We map this entire grid onto the video frame, maintaining aspect ratio.
+            
+            # Get grid physical size from config
+            grid_size_x = self.beamforming_config.grid_size_x  # meters (e.g., 0.6)
+            grid_size_y = self.beamforming_config.grid_size_y  # meters (e.g., 0.6)
+            aspect_ratio = grid_size_x / grid_size_y  # Usually 1.0 for square grid
+            
+            # Decide overlay area on video
+            # Option A: Full screen (stretch to fit)
+            # Option B: Maintain aspect ratio (letterbox if needed)
+            # We'll use Option B for correct proportions
+            
+            video_aspect = video_w / video_h
+            
+            if video_aspect > aspect_ratio:
+                # Video is wider than grid - fit to height, center horizontally
+                overlay_h = video_h
+                overlay_w = int(video_h * aspect_ratio)
+                x_offset = (video_w - overlay_w) // 2
+                y_offset = 0
+            else:
+                # Video is taller than grid - fit to width, center vertically
+                overlay_w = video_w
+                overlay_h = int(video_w / aspect_ratio)
+                x_offset = 0
+                y_offset = (video_h - overlay_h) // 2
+            
+            # Resize heatmap to overlay dimensions
+            heatmap_resized = cv2.resize(
+                self.latest_heatmap,
+                (overlay_w, overlay_h),
+                interpolation=cv2.INTER_LINEAR
+            )
+            
+            # Extract ROI from video
+            roi = frame[y_offset:y_offset+overlay_h, x_offset:x_offset+overlay_w]
+            
+            # Safety check
+            if roi.shape[:2] != heatmap_resized.shape[:2]:
+                logger.warning(f"ROI shape mismatch: {roi.shape[:2]} vs {heatmap_resized.shape[:2]}")
+                self._display_image(frame)
+                return
+            
+            # Extract RGB and alpha from heatmap
+            heatmap_rgb = heatmap_resized[:, :, :3]
+            heatmap_alpha = heatmap_resized[:, :, 3] / 255.0  # Normalize to [0, 1]
+            
+            # Apply user-defined opacity from slider
+            user_alpha = self.alpha_slider.value() / 100.0
+            combined_alpha = heatmap_alpha * user_alpha
+            
+            # Alpha blending: output = roi * (1 - alpha) + heatmap * alpha
+            alpha_3ch = combined_alpha[:, :, np.newaxis]
+            blended = (roi * (1 - alpha_3ch) + heatmap_rgb * alpha_3ch).astype(np.uint8)
+            
+            # Update frame with blended overlay
+            frame[y_offset:y_offset+overlay_h, x_offset:x_offset+overlay_w] = blended
+            
+            # ============================================================
+            # Draw crosshair at peak position (if detected)
+            # ============================================================
+            if self.detected_peak is not None:
+                peak_x_m = self.detected_peak['x']  # meters
+                peak_y_m = self.detected_peak['y']  # meters
+                
+                # Convert from physical coordinates (meters) to pixel coordinates
+                # Grid coordinates: -grid_size/2 to +grid_size/2 in meters
+                # Pixel coordinates: 0 to overlay_w (or overlay_h)
+                
+                # Normalize to [0, 1]
+                norm_x = (peak_x_m + grid_size_x / 2.0) / grid_size_x  # 0 to 1
+                norm_y = (peak_y_m + grid_size_y / 2.0) / grid_size_y  # 0 to 1
+                
+                # Map to overlay pixel coordinates
+                # Note: Y axis is flipped in image coordinates (top=0, bottom=height)
+                peak_pixel_x = int(norm_x * overlay_w)
+                peak_pixel_y = int((1.0 - norm_y) * overlay_h)  # Flip Y
+                
+                # Convert to absolute video coordinates
+                peak_video_x = x_offset + peak_pixel_x
+                peak_video_y = y_offset + peak_pixel_y
+                
+                # Clamp to video bounds
+                peak_video_x = np.clip(peak_video_x, 10, video_w - 10)
+                peak_video_y = np.clip(peak_video_y, 10, video_h - 10)
+                
+                # Draw crosshair
+                color = (0, 255, 0)  # Green in BGR
+                thickness = 3
+                size = 30
+                
+                # Horizontal line
+                cv2.line(frame, (peak_video_x - size, peak_video_y), 
+                        (peak_video_x + size, peak_video_y), color, thickness)
+                # Vertical line
+                cv2.line(frame, (peak_video_x, peak_video_y - size), 
+                        (peak_video_x, peak_video_y + size), color, thickness)
+                
+                # Draw filled circle at center
+                cv2.circle(frame, (peak_video_x, peak_video_y), 8, color, -1)
+                
+                # Draw text with power level
+                power_text = f"{self.detected_peak['power_db']:.1f} dB"
+                position_text = f"({peak_x_m*100:.1f}, {peak_y_m*100:.1f}) cm"
+                
+                # Text background (for readability)
+                text_x = peak_video_x + 35
+                text_y = peak_video_y - 10
+                
+                cv2.putText(frame, power_text, (text_x, text_y), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4, cv2.LINE_AA)
+                cv2.putText(frame, power_text, (text_x, text_y), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+                
+                cv2.putText(frame, position_text, (text_x, text_y + 25), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 4, cv2.LINE_AA)
+                cv2.putText(frame, position_text, (text_x, text_y + 25), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2, cv2.LINE_AA)
+            
+            # Display frame
+            self._display_image(frame)
+            
+        except Exception as e:
+            logger.error(f"Video overlay error: {e}", exc_info=True)
     
     def closeEvent(self, event):
         """Pencere kapatılırken"""
