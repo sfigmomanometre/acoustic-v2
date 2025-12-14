@@ -13,8 +13,20 @@ import numpy as np
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Tuple, Optional, Dict
+from typing import Tuple, Optional, Dict, List
 import logging
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+import multiprocessing
+
+# Try to import joblib for better parallelization
+try:
+    from joblib import Parallel, delayed
+    HAS_JOBLIB = True
+except ImportError:
+    HAS_JOBLIB = False
+
+# Get number of CPU cores
+N_CORES = multiprocessing.cpu_count()
 
 logger = logging.getLogger(__name__)
 
@@ -297,6 +309,950 @@ def power_to_db(power_map: np.ndarray, reference: float = 1.0) -> np.ndarray:
     power_map_safe = np.maximum(power_map, 1e-10)
     power_db = 10 * np.log10(power_map_safe / reference)
     return power_db
+
+
+def compute_covariance_matrix(
+    mic_signals: np.ndarray,
+    sample_rate: float,
+    freq_range: Tuple[float, float],
+    diagonal_loading: float = 1e-6
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Compute the Cross-Spectral Matrix (CSM) from microphone signals.
+    
+    The CSM is the frequency-domain covariance matrix, computed as:
+    R(f) = X(f) @ X(f)^H
+    
+    Args:
+        mic_signals: (n_samples, n_mics) time-domain microphone signals
+        sample_rate: Sampling rate in Hz
+        freq_range: (freq_min, freq_max) frequency range of interest
+        diagonal_loading: Small value added to diagonal for numerical stability
+        
+    Returns:
+        csm: (n_freqs, n_mics, n_mics) Cross-Spectral Matrix for each frequency
+        freqs: (n_freqs,) frequency bins
+        fft_data: (n_freqs, n_mics) FFT of signals
+    """
+    n_samples, n_mics = mic_signals.shape
+    
+    # FFT
+    fft_data = np.fft.rfft(mic_signals, axis=0)  # (n_freqs, n_mics)
+    freqs = np.fft.rfftfreq(n_samples, 1.0 / sample_rate)
+    
+    # Select frequency range
+    freq_min, freq_max = freq_range
+    freq_mask = (freqs >= freq_min) & (freqs <= freq_max)
+    selected_freqs = freqs[freq_mask]
+    selected_fft = fft_data[freq_mask, :]  # (n_selected_freqs, n_mics)
+    
+    n_freqs = len(selected_freqs)
+    
+    # Compute CSM for each frequency bin
+    # R(f) = X(f) @ X(f)^H where X is column vector of mic signals
+    csm = np.zeros((n_freqs, n_mics, n_mics), dtype=np.complex128)
+    
+    for i in range(n_freqs):
+        X = selected_fft[i, :]  # (n_mics,)
+        # Outer product: X @ X^H
+        csm[i] = np.outer(X, np.conj(X))
+        # Diagonal loading for numerical stability
+        csm[i] += diagonal_loading * np.eye(n_mics)
+    
+    logger.debug(f"Computed CSM: {n_freqs} frequency bins, {n_mics}x{n_mics} matrix")
+    
+    return csm, selected_freqs, selected_fft
+
+
+def mvdr_beamformer(
+    mic_signals: np.ndarray,
+    mic_positions: np.ndarray,
+    grid_points: np.ndarray,
+    sample_rate: float,
+    config: BeamformingConfig,
+    freq_range: Optional[Tuple[float, float]] = None,
+    diagonal_loading: float = 1e-3
+) -> np.ndarray:
+    """
+    MVDR (Minimum Variance Distortionless Response) Beamformer
+    Also known as Capon Beamformer.
+    
+    MVDR minimizes output power while maintaining unity gain in the look direction:
+    
+    w_MVDR = (R^-1 @ a) / (a^H @ R^-1 @ a)
+    P_MVDR = 1 / (a^H @ R^-1 @ a)
+    
+    Where:
+    - R is the covariance (cross-spectral) matrix
+    - a is the steering vector
+    - w is the weight vector
+    
+    Advantages over DAS:
+    - Higher resolution (narrower main lobe)
+    - Better interference rejection
+    - Adaptive to the acoustic environment
+    
+    Args:
+        mic_signals: (n_samples, n_mics) time-domain microphone signals
+        mic_positions: (n_mics, 3) microphone positions in meters
+        grid_points: (n_points, 3) focus grid points in meters
+        sample_rate: Sampling rate in Hz
+        config: BeamformingConfig
+        freq_range: Optional (freq_min, freq_max) tuple to override config
+        diagonal_loading: Regularization parameter (higher = more stable, lower = sharper)
+        
+    Returns:
+        power_map: (n_points,) array of acoustic power at each grid point
+    """
+    import time
+    start_time = time.perf_counter()
+    
+    n_samples, n_mics = mic_signals.shape
+    n_points = len(grid_points)
+    
+    # Frequency range
+    if freq_range is not None:
+        f_min, f_max = freq_range
+    else:
+        f_min, f_max = config.freq_min, config.freq_max
+    
+    # Compute Cross-Spectral Matrix
+    csm, selected_freqs, selected_fft = compute_covariance_matrix(
+        mic_signals, sample_rate, (f_min, f_max), diagonal_loading
+    )
+    
+    if len(selected_freqs) == 0:
+        logger.warning(f"No frequencies in range [{f_min}, {f_max}] Hz")
+        return np.zeros(n_points)
+    
+    n_freqs = len(selected_freqs)
+    
+    logger.debug(f"MVDR: Processing {n_freqs} frequency bins "
+                f"from {selected_freqs[0]:.1f} to {selected_freqs[-1]:.1f} Hz")
+    
+    # Initialize power map
+    power_map = np.zeros(n_points, dtype=np.float64)
+    
+    # Process each frequency bin
+    for freq_idx, freq in enumerate(selected_freqs):
+        # Get CSM for this frequency
+        R = csm[freq_idx]  # (n_mics, n_mics)
+        
+        # Compute inverse of CSM
+        try:
+            R_inv = np.linalg.inv(R)
+        except np.linalg.LinAlgError:
+            # If singular, use pseudo-inverse
+            R_inv = np.linalg.pinv(R)
+            logger.warning(f"CSM singular at {freq:.1f} Hz, using pseudo-inverse")
+        
+        # Compute steering vectors for this frequency: (n_points, n_mics)
+        A = compute_steering_vectors(
+            mic_positions,
+            grid_points,
+            freq,
+            config.sound_speed,
+            config.field_type
+        )
+        
+        # MVDR power for each grid point
+        # P_MVDR(θ) = 1 / (a^H @ R^-1 @ a)
+        for point_idx in range(n_points):
+            a = A[point_idx, :]  # Steering vector for this point (n_mics,)
+            
+            # a^H @ R^-1 @ a
+            denominator = np.real(np.conj(a) @ R_inv @ a)
+            
+            # Avoid division by zero
+            if denominator > 1e-10:
+                power_map[point_idx] += 1.0 / denominator
+            else:
+                power_map[point_idx] += 0.0
+    
+    # Average over frequency bins
+    power_map /= n_freqs
+    
+    elapsed = (time.perf_counter() - start_time) * 1000  # ms
+    logger.debug(f"MVDR beamforming: {n_points} grid points, "
+                f"{n_freqs} freqs, {elapsed:.2f} ms")
+    
+    return power_map
+
+
+def mvdr_beamformer_fast(
+    mic_signals: np.ndarray,
+    mic_positions: np.ndarray,
+    grid_points: np.ndarray,
+    sample_rate: float,
+    config: BeamformingConfig,
+    freq_range: Optional[Tuple[float, float]] = None,
+    diagonal_loading: float = 1e-3
+) -> np.ndarray:
+    """
+    Optimized MVDR Beamformer using vectorized operations.
+    
+    This version processes all grid points simultaneously for each frequency,
+    which is significantly faster than the loop-based version.
+    
+    Args:
+        Same as mvdr_beamformer
+        
+    Returns:
+        power_map: (n_points,) array of acoustic power at each grid point
+    """
+    import time
+    start_time = time.perf_counter()
+    
+    n_samples, n_mics = mic_signals.shape
+    n_points = len(grid_points)
+    
+    # Frequency range
+    if freq_range is not None:
+        f_min, f_max = freq_range
+    else:
+        f_min, f_max = config.freq_min, config.freq_max
+    
+    # Compute Cross-Spectral Matrix
+    csm, selected_freqs, _ = compute_covariance_matrix(
+        mic_signals, sample_rate, (f_min, f_max), diagonal_loading
+    )
+    
+    if len(selected_freqs) == 0:
+        logger.warning(f"No frequencies in range [{f_min}, {f_max}] Hz")
+        return np.zeros(n_points)
+    
+    n_freqs = len(selected_freqs)
+    
+    # Initialize power map
+    power_map = np.zeros(n_points, dtype=np.float64)
+    
+    # Process each frequency bin
+    for freq_idx, freq in enumerate(selected_freqs):
+        R = csm[freq_idx]  # (n_mics, n_mics)
+        
+        # Compute inverse
+        try:
+            R_inv = np.linalg.inv(R)
+        except np.linalg.LinAlgError:
+            R_inv = np.linalg.pinv(R)
+        
+        # Steering vectors: (n_points, n_mics)
+        A = compute_steering_vectors(
+            mic_positions,
+            grid_points,
+            freq,
+            config.sound_speed,
+            config.field_type
+        )
+        
+        # Vectorized MVDR: P = 1 / (a^H @ R^-1 @ a) for all points
+        # A @ R_inv: (n_points, n_mics) @ (n_mics, n_mics) = (n_points, n_mics)
+        AR_inv = A @ R_inv
+        
+        # Element-wise multiply and sum: (a^H @ R^-1 @ a) for each point
+        # Sum of (A_conj * AR_inv) along axis 1
+        denominator = np.real(np.sum(np.conj(A) * AR_inv, axis=1))  # (n_points,)
+        
+        # MVDR power
+        valid_mask = denominator > 1e-10
+        power_map[valid_mask] += 1.0 / denominator[valid_mask]
+    
+    # Average over frequency bins
+    power_map /= n_freqs
+    
+    elapsed = (time.perf_counter() - start_time) * 1000
+    logger.debug(f"MVDR (fast): {n_points} grid points, {n_freqs} freqs, {elapsed:.2f} ms")
+    
+    return power_map
+
+
+def music_beamformer(
+    mic_signals: np.ndarray,
+    mic_positions: np.ndarray,
+    grid_points: np.ndarray,
+    sample_rate: float,
+    config: BeamformingConfig,
+    freq_range: Optional[Tuple[float, float]] = None,
+    n_sources: int = 1,
+    diagonal_loading: float = 1e-6
+) -> np.ndarray:
+    """
+    MUSIC (Multiple Signal Classification) Beamformer
+    
+    MUSIC uses eigenvalue decomposition to separate signal and noise subspaces,
+    providing super-resolution source localization.
+    
+    P_MUSIC(θ) = 1 / (a^H @ E_n @ E_n^H @ a)
+    
+    Where E_n contains the noise subspace eigenvectors.
+    
+    Args:
+        mic_signals: (n_samples, n_mics) time-domain microphone signals
+        mic_positions: (n_mics, 3) microphone positions in meters
+        grid_points: (n_points, 3) focus grid points in meters
+        sample_rate: Sampling rate in Hz
+        config: BeamformingConfig
+        freq_range: Optional (freq_min, freq_max) tuple
+        n_sources: Estimated number of sources (for subspace separation)
+        diagonal_loading: Regularization parameter
+        
+    Returns:
+        power_map: (n_points,) MUSIC pseudo-spectrum
+    """
+    import time
+    start_time = time.perf_counter()
+    
+    n_samples, n_mics = mic_signals.shape
+    n_points = len(grid_points)
+    
+    # Frequency range
+    if freq_range is not None:
+        f_min, f_max = freq_range
+    else:
+        f_min, f_max = config.freq_min, config.freq_max
+    
+    # Compute CSM
+    csm, selected_freqs, _ = compute_covariance_matrix(
+        mic_signals, sample_rate, (f_min, f_max), diagonal_loading
+    )
+    
+    if len(selected_freqs) == 0:
+        return np.zeros(n_points)
+    
+    n_freqs = len(selected_freqs)
+    power_map = np.zeros(n_points, dtype=np.float64)
+    
+    for freq_idx, freq in enumerate(selected_freqs):
+        R = csm[freq_idx]
+        
+        # Eigenvalue decomposition
+        eigenvalues, eigenvectors = np.linalg.eigh(R)
+        
+        # Sort by eigenvalue (descending)
+        idx = np.argsort(eigenvalues)[::-1]
+        eigenvalues = eigenvalues[idx]
+        eigenvectors = eigenvectors[:, idx]
+        
+        # Noise subspace: eigenvectors corresponding to smallest eigenvalues
+        # Assume n_sources largest eigenvalues correspond to signals
+        E_n = eigenvectors[:, n_sources:]  # (n_mics, n_mics - n_sources)
+        
+        # Steering vectors
+        A = compute_steering_vectors(
+            mic_positions, grid_points, freq,
+            config.sound_speed, config.field_type
+        )
+        
+        # MUSIC pseudo-spectrum: P = 1 / |a^H @ E_n|^2
+        # A @ E_n: (n_points, n_mics) @ (n_mics, n_noise) = (n_points, n_noise)
+        projection = A @ E_n
+        
+        # Sum of squared magnitudes along noise subspace
+        denominator = np.sum(np.abs(projection) ** 2, axis=1)  # (n_points,)
+        
+        valid_mask = denominator > 1e-10
+        power_map[valid_mask] += 1.0 / denominator[valid_mask]
+    
+    power_map /= n_freqs
+    
+    elapsed = (time.perf_counter() - start_time) * 1000
+    logger.debug(f"MUSIC: {n_points} grid points, {n_freqs} freqs, "
+                f"{n_sources} sources, {elapsed:.2f} ms")
+    
+    return power_map
+
+
+# ============================================================================
+# OPTIMIZED PARALLEL BEAMFORMING IMPLEMENTATIONS
+# ============================================================================
+
+def _precompute_distances(mic_positions: np.ndarray, grid_points: np.ndarray) -> np.ndarray:
+    """
+    Precompute distances from each grid point to each microphone.
+    This is reused across all frequencies.
+    
+    Args:
+        mic_positions: (n_mics, 3) microphone positions
+        grid_points: (n_points, 3) grid points
+        
+    Returns:
+        distances: (n_points, n_mics) distance matrix
+    """
+    # Broadcasting: (n_points, 1, 3) - (1, n_mics, 3) = (n_points, n_mics, 3)
+    distances = np.linalg.norm(
+        grid_points[:, np.newaxis, :] - mic_positions[np.newaxis, :, :],
+        axis=2
+    )
+    return distances
+
+
+def _compute_steering_vectors_from_distances(
+    distances: np.ndarray,
+    frequency: float,
+    sound_speed: float = 343.0
+) -> np.ndarray:
+    """
+    Compute steering vectors from precomputed distances (near-field only).
+    Much faster than recomputing distances every time.
+    
+    Args:
+        distances: (n_points, n_mics) precomputed distances
+        frequency: Frequency in Hz
+        sound_speed: Speed of sound in m/s
+        
+    Returns:
+        steering_vectors: (n_points, n_mics) complex array
+    """
+    k = 2 * np.pi * frequency / sound_speed
+    return np.exp(1j * k * distances)
+
+
+def das_beamformer_parallel(
+    mic_signals: np.ndarray,
+    mic_positions: np.ndarray,
+    grid_points: np.ndarray,
+    sample_rate: float,
+    config: BeamformingConfig,
+    freq_range: Optional[Tuple[float, float]] = None,
+    n_jobs: int = -1
+) -> np.ndarray:
+    """
+    Parallel DAS Beamformer using all CPU cores.
+    
+    Optimizations:
+    1. Precompute distances once (reused for all frequencies)
+    2. Process frequency bins in parallel using joblib
+    3. Vectorized operations throughout
+    
+    Args:
+        mic_signals: (n_samples, n_mics) time-domain microphone signals
+        mic_positions: (n_mics, 3) microphone positions in meters
+        grid_points: (n_points, 3) focus grid points in meters
+        sample_rate: Sampling rate in Hz
+        config: BeamformingConfig
+        freq_range: Optional (freq_min, freq_max) tuple
+        n_jobs: Number of parallel jobs (-1 = all cores)
+        
+    Returns:
+        power_map: (n_points,) array of acoustic power at each grid point
+    """
+    import time
+    start_time = time.perf_counter()
+    
+    n_samples, n_mics = mic_signals.shape
+    n_points = len(grid_points)
+    
+    if n_jobs == -1:
+        n_jobs = N_CORES
+    
+    # FFT
+    fft_data = np.fft.rfft(mic_signals, axis=0)
+    freqs = np.fft.rfftfreq(n_samples, 1.0 / sample_rate)
+    
+    # Frequency range
+    if freq_range is not None:
+        f_min, f_max = freq_range
+    else:
+        f_min, f_max = config.freq_min, config.freq_max
+    
+    # Select frequency bins
+    freq_mask = (freqs >= f_min) & (freqs <= f_max)
+    selected_freqs = freqs[freq_mask]
+    selected_fft = fft_data[freq_mask, :]
+    
+    if len(selected_freqs) == 0:
+        return np.zeros(n_points)
+    
+    # Precompute distances (only for near-field)
+    if config.field_type == 'near-field':
+        distances = _precompute_distances(mic_positions, grid_points)
+    else:
+        distances = None
+    
+    def process_frequency(freq_idx):
+        """Process a single frequency bin."""
+        freq = selected_freqs[freq_idx]
+        X = selected_fft[freq_idx, :]
+        
+        if config.field_type == 'near-field':
+            A = _compute_steering_vectors_from_distances(distances, freq, config.sound_speed)
+        else:
+            A = compute_steering_vectors(mic_positions, grid_points, freq,
+                                        config.sound_speed, config.field_type)
+        
+        Y = np.sum(A * X[np.newaxis, :], axis=1)
+        return np.abs(Y) ** 2
+    
+    # Parallel processing
+    if HAS_JOBLIB and len(selected_freqs) > 4:
+        results = Parallel(n_jobs=n_jobs, prefer="threads")(
+            delayed(process_frequency)(i) for i in range(len(selected_freqs))
+        )
+        power_map = np.sum(results, axis=0)
+    else:
+        # Fallback to sequential if joblib not available
+        power_map = np.zeros(n_points, dtype=np.float64)
+        for i in range(len(selected_freqs)):
+            power_map += process_frequency(i)
+    
+    power_map /= len(selected_freqs)
+    
+    elapsed = (time.perf_counter() - start_time) * 1000
+    logger.debug(f"DAS (parallel, {n_jobs} cores): {n_points} points, "
+                f"{len(selected_freqs)} freqs, {elapsed:.2f} ms")
+    
+    return power_map
+
+
+def mvdr_beamformer_parallel(
+    mic_signals: np.ndarray,
+    mic_positions: np.ndarray,
+    grid_points: np.ndarray,
+    sample_rate: float,
+    config: BeamformingConfig,
+    freq_range: Optional[Tuple[float, float]] = None,
+    diagonal_loading: float = 1e-3,
+    n_jobs: int = -1
+) -> np.ndarray:
+    """
+    Parallel MVDR Beamformer using all CPU cores.
+    
+    Optimizations:
+    1. Precompute distances once
+    2. Process frequency bins in parallel
+    3. Vectorized matrix operations
+    
+    Args:
+        Same as mvdr_beamformer_fast plus n_jobs
+        
+    Returns:
+        power_map: (n_points,) array of acoustic power at each grid point
+    """
+    import time
+    start_time = time.perf_counter()
+    
+    n_samples, n_mics = mic_signals.shape
+    n_points = len(grid_points)
+    
+    if n_jobs == -1:
+        n_jobs = N_CORES
+    
+    # Frequency range
+    if freq_range is not None:
+        f_min, f_max = freq_range
+    else:
+        f_min, f_max = config.freq_min, config.freq_max
+    
+    # Compute CSM
+    csm, selected_freqs, _ = compute_covariance_matrix(
+        mic_signals, sample_rate, (f_min, f_max), diagonal_loading
+    )
+    
+    if len(selected_freqs) == 0:
+        return np.zeros(n_points)
+    
+    n_freqs = len(selected_freqs)
+    
+    # Precompute distances
+    if config.field_type == 'near-field':
+        distances = _precompute_distances(mic_positions, grid_points)
+    else:
+        distances = None
+    
+    def process_frequency(freq_idx):
+        """Process a single frequency bin for MVDR."""
+        freq = selected_freqs[freq_idx]
+        R = csm[freq_idx]
+        
+        # Compute inverse
+        try:
+            R_inv = np.linalg.inv(R)
+        except np.linalg.LinAlgError:
+            R_inv = np.linalg.pinv(R)
+        
+        # Steering vectors
+        if config.field_type == 'near-field':
+            A = _compute_steering_vectors_from_distances(distances, freq, config.sound_speed)
+        else:
+            A = compute_steering_vectors(mic_positions, grid_points, freq,
+                                        config.sound_speed, config.field_type)
+        
+        # Vectorized MVDR
+        AR_inv = A @ R_inv
+        denominator = np.real(np.sum(np.conj(A) * AR_inv, axis=1))
+        
+        result = np.zeros(n_points, dtype=np.float64)
+        valid_mask = denominator > 1e-10
+        result[valid_mask] = 1.0 / denominator[valid_mask]
+        return result
+    
+    # Parallel processing
+    if HAS_JOBLIB and n_freqs > 4:
+        results = Parallel(n_jobs=n_jobs, prefer="threads")(
+            delayed(process_frequency)(i) for i in range(n_freqs)
+        )
+        power_map = np.sum(results, axis=0)
+    else:
+        power_map = np.zeros(n_points, dtype=np.float64)
+        for i in range(n_freqs):
+            power_map += process_frequency(i)
+    
+    power_map /= n_freqs
+    
+    elapsed = (time.perf_counter() - start_time) * 1000
+    logger.debug(f"MVDR (parallel, {n_jobs} cores): {n_points} points, "
+                f"{n_freqs} freqs, {elapsed:.2f} ms")
+    
+    return power_map
+
+
+def music_beamformer_parallel(
+    mic_signals: np.ndarray,
+    mic_positions: np.ndarray,
+    grid_points: np.ndarray,
+    sample_rate: float,
+    config: BeamformingConfig,
+    freq_range: Optional[Tuple[float, float]] = None,
+    n_sources: int = 1,
+    diagonal_loading: float = 1e-6,
+    n_jobs: int = -1
+) -> np.ndarray:
+    """
+    Parallel MUSIC Beamformer using all CPU cores.
+    
+    Args:
+        Same as music_beamformer plus n_jobs
+        
+    Returns:
+        power_map: (n_points,) MUSIC pseudo-spectrum
+    """
+    import time
+    start_time = time.perf_counter()
+    
+    n_samples, n_mics = mic_signals.shape
+    n_points = len(grid_points)
+    
+    if n_jobs == -1:
+        n_jobs = N_CORES
+    
+    # Frequency range
+    if freq_range is not None:
+        f_min, f_max = freq_range
+    else:
+        f_min, f_max = config.freq_min, config.freq_max
+    
+    # Compute CSM
+    csm, selected_freqs, _ = compute_covariance_matrix(
+        mic_signals, sample_rate, (f_min, f_max), diagonal_loading
+    )
+    
+    if len(selected_freqs) == 0:
+        return np.zeros(n_points)
+    
+    n_freqs = len(selected_freqs)
+    
+    # Precompute distances
+    if config.field_type == 'near-field':
+        distances = _precompute_distances(mic_positions, grid_points)
+    else:
+        distances = None
+    
+    def process_frequency(freq_idx):
+        """Process a single frequency bin for MUSIC."""
+        freq = selected_freqs[freq_idx]
+        R = csm[freq_idx]
+        
+        # Eigenvalue decomposition
+        eigenvalues, eigenvectors = np.linalg.eigh(R)
+        
+        # Sort by eigenvalue (descending)
+        idx = np.argsort(eigenvalues)[::-1]
+        eigenvectors = eigenvectors[:, idx]
+        
+        # Noise subspace
+        E_n = eigenvectors[:, n_sources:]
+        
+        # Steering vectors
+        if config.field_type == 'near-field':
+            A = _compute_steering_vectors_from_distances(distances, freq, config.sound_speed)
+        else:
+            A = compute_steering_vectors(mic_positions, grid_points, freq,
+                                        config.sound_speed, config.field_type)
+        
+        # MUSIC pseudo-spectrum
+        projection = A @ E_n
+        denominator = np.sum(np.abs(projection) ** 2, axis=1)
+        
+        result = np.zeros(n_points, dtype=np.float64)
+        valid_mask = denominator > 1e-10
+        result[valid_mask] = 1.0 / denominator[valid_mask]
+        return result
+    
+    # Parallel processing
+    if HAS_JOBLIB and n_freqs > 4:
+        results = Parallel(n_jobs=n_jobs, prefer="threads")(
+            delayed(process_frequency)(i) for i in range(n_freqs)
+        )
+        power_map = np.sum(results, axis=0)
+    else:
+        power_map = np.zeros(n_points, dtype=np.float64)
+        for i in range(n_freqs):
+            power_map += process_frequency(i)
+    
+    power_map /= n_freqs
+    
+    elapsed = (time.perf_counter() - start_time) * 1000
+    logger.debug(f"MUSIC (parallel, {n_jobs} cores): {n_points} points, "
+                f"{n_freqs} freqs, {n_sources} sources, {elapsed:.2f} ms")
+    
+    return power_map
+
+
+# ============================================================================
+# ULTRA-FAST BEAMFORMING (Reduced frequency bins, coarser grid)
+# ============================================================================
+
+def das_beamformer_realtime(
+    mic_signals: np.ndarray,
+    mic_positions: np.ndarray,
+    grid_points: np.ndarray,
+    sample_rate: float,
+    config: BeamformingConfig,
+    freq_range: Optional[Tuple[float, float]] = None,
+    max_freq_bins: int = 10,
+    distances: Optional[np.ndarray] = None
+) -> np.ndarray:
+    """
+    Ultra-fast DAS beamformer for real-time operation.
+    
+    Optimizations:
+    1. Limit number of frequency bins
+    2. Accept precomputed distances
+    3. Fully vectorized - no loops
+    
+    Args:
+        mic_signals: (n_samples, n_mics) time-domain signals
+        mic_positions: (n_mics, 3) microphone positions
+        grid_points: (n_points, 3) grid points
+        sample_rate: Sampling rate
+        config: BeamformingConfig
+        freq_range: Frequency range
+        max_freq_bins: Maximum frequency bins to process (for speed)
+        distances: Precomputed distances (optional, for repeated calls)
+        
+    Returns:
+        power_map: (n_points,) power at each grid point
+    """
+    n_samples, n_mics = mic_signals.shape
+    n_points = len(grid_points)
+    
+    # FFT
+    fft_data = np.fft.rfft(mic_signals, axis=0)
+    freqs = np.fft.rfftfreq(n_samples, 1.0 / sample_rate)
+    
+    # Frequency range
+    if freq_range is not None:
+        f_min, f_max = freq_range
+    else:
+        f_min, f_max = config.freq_min, config.freq_max
+    
+    # Select and subsample frequency bins
+    freq_mask = (freqs >= f_min) & (freqs <= f_max)
+    freq_indices = np.where(freq_mask)[0]
+    
+    if len(freq_indices) == 0:
+        return np.zeros(n_points)
+    
+    # Subsample to max_freq_bins
+    if len(freq_indices) > max_freq_bins:
+        step = len(freq_indices) // max_freq_bins
+        freq_indices = freq_indices[::step][:max_freq_bins]
+    
+    selected_freqs = freqs[freq_indices]
+    selected_fft = fft_data[freq_indices, :]
+    
+    # Precompute distances if not provided
+    if distances is None and config.field_type == 'near-field':
+        distances = _precompute_distances(mic_positions, grid_points)
+    
+    # Initialize power map
+    power_map = np.zeros(n_points, dtype=np.float64)
+    
+    # Process all frequencies (vectorized)
+    for freq_idx, freq in enumerate(selected_freqs):
+        X = selected_fft[freq_idx, :]
+        
+        if config.field_type == 'near-field':
+            A = _compute_steering_vectors_from_distances(distances, freq, config.sound_speed)
+        else:
+            A = compute_steering_vectors(mic_positions, grid_points, freq,
+                                        config.sound_speed, config.field_type)
+        
+        Y = np.sum(A * X[np.newaxis, :], axis=1)
+        power_map += np.abs(Y) ** 2
+    
+    power_map /= len(selected_freqs)
+    
+    return power_map
+
+
+def mvdr_beamformer_realtime(
+    mic_signals: np.ndarray,
+    mic_positions: np.ndarray,
+    grid_points: np.ndarray,
+    sample_rate: float,
+    config: BeamformingConfig,
+    freq_range: Optional[Tuple[float, float]] = None,
+    diagonal_loading: float = 1e-3,
+    max_freq_bins: int = 10,
+    distances: Optional[np.ndarray] = None
+) -> np.ndarray:
+    """
+    Ultra-fast MVDR beamformer for real-time operation.
+    
+    Args:
+        Same as das_beamformer_realtime plus diagonal_loading
+        
+    Returns:
+        power_map: (n_points,) power at each grid point
+    """
+    n_samples, n_mics = mic_signals.shape
+    n_points = len(grid_points)
+    
+    # Frequency range
+    if freq_range is not None:
+        f_min, f_max = freq_range
+    else:
+        f_min, f_max = config.freq_min, config.freq_max
+    
+    # Compute CSM
+    csm, all_freqs, _ = compute_covariance_matrix(
+        mic_signals, sample_rate, (f_min, f_max), diagonal_loading
+    )
+    
+    if len(all_freqs) == 0:
+        return np.zeros(n_points)
+    
+    # Subsample frequencies
+    if len(all_freqs) > max_freq_bins:
+        step = len(all_freqs) // max_freq_bins
+        indices = list(range(0, len(all_freqs), step))[:max_freq_bins]
+        selected_freqs = all_freqs[indices]
+        csm = csm[indices]
+    else:
+        selected_freqs = all_freqs
+    
+    n_freqs = len(selected_freqs)
+    
+    # Precompute distances
+    if distances is None and config.field_type == 'near-field':
+        distances = _precompute_distances(mic_positions, grid_points)
+    
+    power_map = np.zeros(n_points, dtype=np.float64)
+    
+    for freq_idx, freq in enumerate(selected_freqs):
+        R = csm[freq_idx]
+        
+        try:
+            R_inv = np.linalg.inv(R)
+        except np.linalg.LinAlgError:
+            R_inv = np.linalg.pinv(R)
+        
+        if config.field_type == 'near-field':
+            A = _compute_steering_vectors_from_distances(distances, freq, config.sound_speed)
+        else:
+            A = compute_steering_vectors(mic_positions, grid_points, freq,
+                                        config.sound_speed, config.field_type)
+        
+        AR_inv = A @ R_inv
+        denominator = np.real(np.sum(np.conj(A) * AR_inv, axis=1))
+        
+        valid_mask = denominator > 1e-10
+        power_map[valid_mask] += 1.0 / denominator[valid_mask]
+    
+    power_map /= n_freqs
+    
+    return power_map
+
+
+def music_beamformer_realtime(
+    mic_signals: np.ndarray,
+    mic_positions: np.ndarray,
+    grid_points: np.ndarray,
+    sample_rate: float,
+    config: BeamformingConfig,
+    freq_range: Optional[Tuple[float, float]] = None,
+    n_sources: int = 1,
+    diagonal_loading: float = 1e-6,
+    max_freq_bins: int = 10,
+    distances: Optional[np.ndarray] = None
+) -> np.ndarray:
+    """
+    Ultra-fast MUSIC beamformer for real-time operation.
+    
+    Args:
+        Same as das_beamformer_realtime plus n_sources and diagonal_loading
+        
+    Returns:
+        power_map: (n_points,) MUSIC pseudo-spectrum
+    """
+    n_samples, n_mics = mic_signals.shape
+    n_points = len(grid_points)
+    
+    # Frequency range
+    if freq_range is not None:
+        f_min, f_max = freq_range
+    else:
+        f_min, f_max = config.freq_min, config.freq_max
+    
+    # Compute CSM
+    csm, all_freqs, _ = compute_covariance_matrix(
+        mic_signals, sample_rate, (f_min, f_max), diagonal_loading
+    )
+    
+    if len(all_freqs) == 0:
+        return np.zeros(n_points)
+    
+    # Subsample frequencies
+    if len(all_freqs) > max_freq_bins:
+        step = len(all_freqs) // max_freq_bins
+        indices = list(range(0, len(all_freqs), step))[:max_freq_bins]
+        selected_freqs = all_freqs[indices]
+        csm = csm[indices]
+    else:
+        selected_freqs = all_freqs
+    
+    n_freqs = len(selected_freqs)
+    
+    # Precompute distances
+    if distances is None and config.field_type == 'near-field':
+        distances = _precompute_distances(mic_positions, grid_points)
+    
+    power_map = np.zeros(n_points, dtype=np.float64)
+    
+    for freq_idx, freq in enumerate(selected_freqs):
+        R = csm[freq_idx]
+        
+        eigenvalues, eigenvectors = np.linalg.eigh(R)
+        idx = np.argsort(eigenvalues)[::-1]
+        eigenvectors = eigenvectors[:, idx]
+        E_n = eigenvectors[:, n_sources:]
+        
+        if config.field_type == 'near-field':
+            A = _compute_steering_vectors_from_distances(distances, freq, config.sound_speed)
+        else:
+            A = compute_steering_vectors(mic_positions, grid_points, freq,
+                                        config.sound_speed, config.field_type)
+        
+        projection = A @ E_n
+        denominator = np.sum(np.abs(projection) ** 2, axis=1)
+        
+        valid_mask = denominator > 1e-10
+        power_map[valid_mask] += 1.0 / denominator[valid_mask]
+    
+    power_map /= n_freqs
+    
+    return power_map
 
 
 def normalize_power_map(

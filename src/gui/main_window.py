@@ -57,9 +57,15 @@ from algorithms.beamforming import (
     load_mic_geometry,
     create_focus_grid,
     das_beamformer,
+    das_beamformer_realtime,
+    mvdr_beamformer_fast,
+    mvdr_beamformer_realtime,
+    music_beamformer,
+    music_beamformer_realtime,
     power_to_db,
     normalize_power_map,
-    BeamformingConfig
+    BeamformingConfig,
+    _precompute_distances
 )
 from scipy.ndimage import gaussian_filter
 
@@ -111,9 +117,12 @@ class AcousticCameraGUI(QMainWindow):
         self.grid_points = None
         self.grid_shape = None
         self.beamforming_counter = 0
-        self.beamforming_interval = 2  # Her 2 callback'te bir beamforming (15 FPS hedef)
+        self.beamforming_interval = 1  # Her callback'te beamforming (daha hızlı güncelleme)
         self.latest_heatmap = None  # Cached heatmap for overlay
-        self.detected_peak = None  # (x, y, z, power_db, grid_row, grid_col)
+        self.detected_peak = None  # Legacy: single peak (x, y, z, power_db, grid_row, grid_col)
+        self.detected_peaks = []  # Multiple peaks list
+        self.cached_distances = None  # Precomputed distances for realtime beamforming
+        self.max_freq_bins = 8  # Limit frequency bins for speed
         
         # Performance monitoring
         self.beamforming_times = []  # Track processing times
@@ -322,7 +331,16 @@ class AcousticCameraGUI(QMainWindow):
             "MUSIC",
             "CLEAN-SC"
         ])
+        self.algorithm_combo.currentTextChanged.connect(self._on_algorithm_changed)
         layout.addWidget(self.algorithm_combo)
+        
+        # Number of sources (for MUSIC algorithm)
+        layout.addWidget(QLabel("Kaynak Sayısı (MUSIC için):"))
+        self.n_sources_spin = QSpinBox()
+        self.n_sources_spin.setRange(1, 10)
+        self.n_sources_spin.setValue(1)
+        self.n_sources_spin.setToolTip("MUSIC algoritması için beklenen kaynak sayısı")
+        layout.addWidget(self.n_sources_spin)
         
         # Frekans aralığı - DOUBLE RANGE SLIDER
         layout.addWidget(QLabel("Frekans Aralığı (Hz):"))
@@ -1069,6 +1087,17 @@ class AcousticCameraGUI(QMainWindow):
         logger.debug(f"dB aralığı: {min_val} - {max_val} dB")
         # dB range is used in heatmap rendering, no need to rebuild config
     
+    def _on_algorithm_changed(self, algorithm_name):
+        """Algoritma değiştiğinde"""
+        logger.info(f"Algoritma değişti: {algorithm_name}")
+        # Enable/disable n_sources spinner based on algorithm
+        is_music = "MUSIC" in algorithm_name
+        self.n_sources_spin.setEnabled(is_music)
+        if is_music:
+            self.n_sources_spin.setStyleSheet("")
+        else:
+            self.n_sources_spin.setStyleSheet("color: gray;")
+    
     def _on_beamforming_toggle(self, state):
         """Beamforming checkbox toggle"""
         self.beamforming_enabled = (state == Qt.CheckState.Checked.value)
@@ -1218,6 +1247,11 @@ class AcousticCameraGUI(QMainWindow):
             # Create focus grid
             self.grid_points, self.grid_shape = create_focus_grid(self.beamforming_config)
             
+            # Precompute distances for realtime beamforming (major speedup)
+            if self.mic_positions is not None and self.grid_points is not None:
+                self.cached_distances = _precompute_distances(self.mic_positions, self.grid_points)
+                logger.info(f"Precomputed distance matrix: {self.cached_distances.shape}")
+            
             logger.info(f"Beamforming config updated: {self.grid_shape[0]}x{self.grid_shape[1]} grid, "
                        f"freq=[{freq_min}, {freq_max}] Hz, z={focus_distance}m")
             
@@ -1227,6 +1261,11 @@ class AcousticCameraGUI(QMainWindow):
     def _run_beamforming(self, audio_data: np.ndarray, sample_rate: float):
         """
         Run beamforming on audio data and generate heatmap
+        
+        Uses optimized realtime beamformers with:
+        - Precomputed distances
+        - Limited frequency bins
+        - Vectorized operations
         
         Args:
             audio_data: (n_samples, n_mics) audio data
@@ -1240,14 +1279,43 @@ class AcousticCameraGUI(QMainWindow):
             if self.mic_positions is None or self.grid_points is None:
                 return
             
-            # Run DAS beamformer
-            power_map = das_beamformer(
-                audio_data,
-                self.mic_positions,
-                self.grid_points,
-                sample_rate,
-                self.beamforming_config
-            )
+            # Get selected algorithm and n_sources
+            algorithm = self.algorithm_combo.currentText()
+            n_sources = self.n_sources_spin.value()
+            
+            # Run selected beamformer (using REALTIME optimized versions)
+            if "MVDR" in algorithm or "Minimum Variance" in algorithm:
+                power_map = mvdr_beamformer_realtime(
+                    audio_data,
+                    self.mic_positions,
+                    self.grid_points,
+                    sample_rate,
+                    self.beamforming_config,
+                    diagonal_loading=1e-3,
+                    max_freq_bins=self.max_freq_bins,
+                    distances=self.cached_distances
+                )
+            elif "MUSIC" in algorithm:
+                power_map = music_beamformer_realtime(
+                    audio_data,
+                    self.mic_positions,
+                    self.grid_points,
+                    sample_rate,
+                    self.beamforming_config,
+                    n_sources=n_sources,
+                    max_freq_bins=self.max_freq_bins,
+                    distances=self.cached_distances
+                )
+            else:  # Default: DAS
+                power_map = das_beamformer_realtime(
+                    audio_data,
+                    self.mic_positions,
+                    self.grid_points,
+                    sample_rate,
+                    self.beamforming_config,
+                    max_freq_bins=self.max_freq_bins,
+                    distances=self.cached_distances
+                )
             
             # Convert to dB
             power_db = power_to_db(power_map)
@@ -1255,8 +1323,10 @@ class AcousticCameraGUI(QMainWindow):
             # Reshape to 2D grid
             power_grid = power_db.reshape(self.grid_shape)
             
-            # Find peak (brightest point) in power grid
-            self.detected_peak = self._detect_peak(power_grid, power_db)
+            # Find multiple peaks in power grid
+            self.detected_peaks = self._detect_multiple_peaks(power_grid, power_db, n_sources)
+            # Keep legacy single peak for compatibility
+            self.detected_peak = self.detected_peaks[0] if self.detected_peaks else None
             
             # Convert to heatmap (RGB image)
             self.latest_heatmap = self._power_to_heatmap(power_grid)
@@ -1271,7 +1341,7 @@ class AcousticCameraGUI(QMainWindow):
                 self.beamforming_times.pop(0)
             
             avg_time = np.mean(self.beamforming_times)
-            logger.debug(f"Beamforming: {elapsed:.1f} ms (avg: {avg_time:.1f} ms)")
+            logger.debug(f"Beamforming ({algorithm}): {elapsed:.1f} ms (avg: {avg_time:.1f} ms)")
             
         except Exception as e:
             logger.error(f"Beamforming error: {e}", exc_info=True)
@@ -1324,6 +1394,93 @@ class AcousticCameraGUI(QMainWindow):
         except Exception as e:
             logger.error(f"Peak detection error: {e}")
             return None
+    
+    def _detect_multiple_peaks(self, power_grid: np.ndarray, power_map_1d: np.ndarray, n_peaks: int = 1) -> list:
+        """
+        Detect multiple peaks (local maxima) in the power grid
+        
+        Uses scipy's peak_local_max to find local maxima, then filters by threshold
+        and returns the top n_peaks.
+        
+        Args:
+            power_grid: (height, width) power in dB
+            power_map_1d: (n_points,) power map (1D, before reshape)
+            n_peaks: Maximum number of peaks to detect
+            
+        Returns:
+            List of dicts with keys: x, y, z, power_db, grid_row, grid_col
+        """
+        from scipy.ndimage import maximum_filter, label
+        
+        try:
+            # Get dB threshold
+            db_min, db_max = self.db_range_slider.values()
+            threshold = db_min + (db_max - db_min) * 0.2  # 20% above min
+            
+            # Find local maxima using maximum filter
+            # A point is a local maximum if it equals the maximum in its neighborhood
+            neighborhood_size = 5  # Size of neighborhood for local max detection
+            local_max = maximum_filter(power_grid, size=neighborhood_size)
+            
+            # Detect peaks: points that are local maxima and above threshold
+            peak_mask = (power_grid == local_max) & (power_grid > threshold)
+            
+            # Get coordinates of all peaks
+            peak_coords = np.where(peak_mask)
+            
+            if len(peak_coords[0]) == 0:
+                return []
+            
+            # Get power values at peak locations
+            peak_powers = power_grid[peak_coords]
+            
+            # Sort by power (descending) and take top n_peaks
+            sorted_indices = np.argsort(peak_powers)[::-1]
+            top_indices = sorted_indices[:n_peaks]
+            
+            peaks = []
+            colors = [
+                (0, 255, 0),    # Green - primary
+                (255, 165, 0),  # Orange - secondary
+                (255, 0, 255),  # Magenta
+                (0, 255, 255),  # Cyan
+                (255, 255, 0),  # Yellow
+                (255, 0, 0),    # Red
+                (0, 0, 255),    # Blue
+                (128, 0, 128),  # Purple
+                (0, 128, 128),  # Teal
+                (128, 128, 0),  # Olive
+            ]
+            
+            for i, idx in enumerate(top_indices):
+                grid_row = peak_coords[0][idx]
+                grid_col = peak_coords[1][idx]
+                power_val = peak_powers[idx]
+                
+                # Convert 2D grid index to 1D index
+                max_idx_1d = grid_row * self.grid_shape[1] + grid_col
+                
+                # Get 3D position from grid_points
+                peak_position = self.grid_points[max_idx_1d]
+                
+                peak_info = {
+                    'x': peak_position[0],
+                    'y': peak_position[1],
+                    'z': peak_position[2],
+                    'power_db': power_val,
+                    'grid_row': grid_row,
+                    'grid_col': grid_col,
+                    'color': colors[i % len(colors)],  # Assign color for visualization
+                    'index': i + 1  # 1-based index for display
+                }
+                peaks.append(peak_info)
+            
+            logger.debug(f"Detected {len(peaks)} peaks")
+            return peaks
+            
+        except Exception as e:
+            logger.error(f"Multi-peak detection error: {e}")
+            return []
     
     def _power_to_heatmap(self, power_grid: np.ndarray) -> np.ndarray:
         """
@@ -1469,11 +1626,13 @@ class AcousticCameraGUI(QMainWindow):
             frame[y_offset:y_offset+overlay_h, x_offset:x_offset+overlay_w] = blended
             
             # ============================================================
-            # Draw crosshair at peak position (if detected)
+            # Draw crosshairs at all detected peak positions
             # ============================================================
-            if self.detected_peak is not None:
-                peak_x_m = self.detected_peak['x']  # meters
-                peak_y_m = self.detected_peak['y']  # meters
+            for peak in self.detected_peaks:
+                peak_x_m = peak['x']  # meters
+                peak_y_m = peak['y']  # meters
+                color = peak.get('color', (0, 255, 0))  # BGR color
+                peak_index = peak.get('index', 1)
                 
                 # Convert from physical coordinates (meters) to pixel coordinates
                 # Grid coordinates: -grid_size/2 to +grid_size/2 in meters
@@ -1497,9 +1656,8 @@ class AcousticCameraGUI(QMainWindow):
                 peak_video_y = np.clip(peak_video_y, 10, video_h - 10)
                 
                 # Draw crosshair
-                color = (0, 255, 0)  # Green in BGR
-                thickness = 3
-                size = 30
+                thickness = 3 if peak_index == 1 else 2  # Primary peak is thicker
+                size = 30 if peak_index == 1 else 20  # Primary peak is larger
                 
                 # Horizontal line
                 cv2.line(frame, (peak_video_x - size, peak_video_y), 
@@ -1509,25 +1667,35 @@ class AcousticCameraGUI(QMainWindow):
                         (peak_video_x, peak_video_y + size), color, thickness)
                 
                 # Draw filled circle at center
-                cv2.circle(frame, (peak_video_x, peak_video_y), 8, color, -1)
+                circle_radius = 8 if peak_index == 1 else 5
+                cv2.circle(frame, (peak_video_x, peak_video_y), circle_radius, color, -1)
                 
-                # Draw text with power level
-                power_text = f"{self.detected_peak['power_db']:.1f} dB"
-                position_text = f"({peak_x_m*100:.1f}, {peak_y_m*100:.1f}) cm"
+                # Draw source number
+                cv2.putText(frame, str(peak_index), 
+                           (peak_video_x - 5, peak_video_y - size - 5),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
+                cv2.putText(frame, str(peak_index), 
+                           (peak_video_x - 5, peak_video_y - size - 5),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
                 
-                # Text background (for readability)
-                text_x = peak_video_x + 35
-                text_y = peak_video_y - 10
-                
-                cv2.putText(frame, power_text, (text_x, text_y), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4, cv2.LINE_AA)
-                cv2.putText(frame, power_text, (text_x, text_y), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
-                
-                cv2.putText(frame, position_text, (text_x, text_y + 25), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 4, cv2.LINE_AA)
-                cv2.putText(frame, position_text, (text_x, text_y + 25), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2, cv2.LINE_AA)
+                # Draw text with power level (only for primary peak to avoid clutter)
+                if peak_index == 1:
+                    power_text = f"{peak['power_db']:.1f} dB"
+                    position_text = f"({peak_x_m*100:.1f}, {peak_y_m*100:.1f}) cm"
+                    
+                    # Text background (for readability)
+                    text_x = peak_video_x + 35
+                    text_y = peak_video_y - 10
+                    
+                    cv2.putText(frame, power_text, (text_x, text_y), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4, cv2.LINE_AA)
+                    cv2.putText(frame, power_text, (text_x, text_y), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+                    
+                    cv2.putText(frame, position_text, (text_x, text_y + 25), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 4, cv2.LINE_AA)
+                    cv2.putText(frame, position_text, (text_x, text_y + 25), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
             
             # Display frame
             self._display_image(frame)
