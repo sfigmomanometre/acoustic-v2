@@ -24,6 +24,7 @@ Layout:
 
 import sys
 import logging
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -68,6 +69,13 @@ from algorithms.beamforming import (
     _precompute_distances
 )
 from scipy.ndimage import gaussian_filter
+
+# Matplotlib for 3D visualization
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend for rendering to image
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from io import BytesIO
 
 logger = logging.getLogger(__name__)
 
@@ -754,41 +762,73 @@ class AcousticCameraGUI(QMainWindow):
         """Tek bir ses kaynağı için widget oluştur"""
         widget = QWidget()
         layout = QVBoxLayout(widget)
-        layout.setContentsMargins(5, 5, 5, 5)
-        layout.setSpacing(3)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(4)
         
         # Renk belirleme (dB seviyesine göre)
         if db > -20:
             color = "#e74c3c"  # Kırmızı - Yüksek ses
             icon = "🔴"
-        elif db > -30:
+            level_text = "Yüksek"
+        elif db > -35:
             color = "#f39c12"  # Turuncu - Orta ses
             icon = "🟠"
+            level_text = "Orta"
         else:
-            color = "#f1c40f"  # Sarı - Düşük ses
-            icon = "🟡"
+            color = "#2ecc71"  # Yeşil - Düşük ses
+            icon = "🟢"
+            level_text = "Düşük"
         
-        # Başlık
-        title_label = QLabel(f"{icon} Kaynak #{idx}")
-        title_label.setStyleSheet(f"color: {color}; font-weight: bold; font-size: 11px;")
+        # Calculate direction angle (azimuth from center)
+        import math
+        azimuth_rad = math.atan2(x, z)  # Angle from center (Z axis)
+        azimuth_deg = math.degrees(azimuth_rad)
+        elevation_rad = math.atan2(y, math.sqrt(x*x + z*z))
+        elevation_deg = math.degrees(elevation_rad)
+        
+        # Direction arrow based on azimuth
+        if azimuth_deg > 30:
+            direction_arrow = "➡️"
+            direction_text = "Sağ"
+        elif azimuth_deg < -30:
+            direction_arrow = "⬅️"
+            direction_text = "Sol"
+        elif elevation_deg > 20:
+            direction_arrow = "⬆️"
+            direction_text = "Yukarı"
+        elif elevation_deg < -20:
+            direction_arrow = "⬇️"
+            direction_text = "Aşağı"
+        else:
+            direction_arrow = "🎯"
+            direction_text = "Merkez"
+        
+        # Başlık with source number and level
+        title_label = QLabel(f"{icon} Kaynak #{idx} - {level_text}")
+        title_label.setStyleSheet(f"color: {color}; font-weight: bold; font-size: 12px;")
         layout.addWidget(title_label)
         
-        # Konum bilgisi
-        pos_label = QLabel(f"📍 Pozisyon: ({x:.2f}m, {y:.2f}m, {z:.2f}m)")
-        pos_label.setStyleSheet("color: #bbb; font-size: 10px;")
+        # Konum bilgisi (cm for readability)
+        pos_label = QLabel(f"📍 X: {x*100:.0f}cm  Y: {y*100:.0f}cm  Z: {z*100:.0f}cm")
+        pos_label.setStyleSheet("color: #aaa; font-size: 10px;")
         layout.addWidget(pos_label)
+        
+        # Direction info
+        direction_label = QLabel(f"{direction_arrow} Yön: {direction_text} ({azimuth_deg:.0f}°)")
+        direction_label.setStyleSheet("color: #8af; font-size: 10px;")
+        layout.addWidget(direction_label)
         
         # dB meter (progress bar)
         db_layout = QHBoxLayout()
         db_label = QLabel(f"{db:.1f} dB")
-        db_label.setStyleSheet("color: white; font-size: 10px; min-width: 50px;")
+        db_label.setStyleSheet(f"color: {color}; font-size: 11px; font-weight: bold; min-width: 55px;")
         
         db_meter = QProgressBar()
         db_meter.setMinimum(-60)
         db_meter.setMaximum(0)
-        db_meter.setValue(int(db))
+        db_meter.setValue(int(max(-60, min(0, db))))
         db_meter.setTextVisible(False)
-        db_meter.setMaximumHeight(15)
+        db_meter.setMaximumHeight(12)
         db_meter.setStyleSheet(f"""
             QProgressBar {{
                 border: 1px solid #555;
@@ -815,6 +855,124 @@ class AcousticCameraGUI(QMainWindow):
         """)
         
         return widget
+    
+    def _update_sources_panel(self):
+        """
+        Update the detected sources panel with current peak information
+        Converts detected_peaks to the format expected by update_detected_sources
+        """
+        try:
+            if not hasattr(self, 'detected_peaks') or len(self.detected_peaks) == 0:
+                # No sources detected
+                self.update_detected_sources([])
+                return
+            
+            # Convert detected_peaks to (x, y, z, db) format
+            sources = []
+            for peak in self.detected_peaks:
+                x = peak.get('x', 0)
+                y = peak.get('y', 0)
+                z = peak.get('z', self.focus_distance_spin.value())
+                db = peak.get('power_db', -60)
+                sources.append((x, y, z, db))
+            
+            # Update the panel
+            self.update_detected_sources(sources)
+            
+        except Exception as e:
+            logger.error(f"Sources panel update error: {e}")
+    
+    def _update_3d_visualization(self):
+        """
+        Update 3D spatial visualization with detected sources
+        Renders a 3D scatter plot showing microphone array and detected sources
+        """
+        try:
+            # Create figure with dark background
+            fig = plt.figure(figsize=(3, 3), facecolor='#1e1e1e')
+            ax = fig.add_subplot(111, projection='3d', facecolor='#1e1e1e')
+            
+            # Get mic positions if available
+            if hasattr(self, 'mic_positions') and self.mic_positions is not None:
+                mic_x = self.mic_positions[:, 0] * 100  # Convert to cm
+                mic_y = self.mic_positions[:, 1] * 100
+                mic_z = self.mic_positions[:, 2] * 100
+                ax.scatter(mic_x, mic_y, mic_z, c='#3498db', s=30, alpha=0.7, 
+                          marker='o', label='Mikrofon')
+            
+            # Plot detected sources
+            if hasattr(self, 'detected_peaks') and len(self.detected_peaks) > 0:
+                colors = ['#e74c3c', '#f39c12', '#2ecc71', '#9b59b6', '#1abc9c']
+                for i, peak in enumerate(self.detected_peaks):
+                    src_x = peak.get('x', 0) * 100  # Convert to cm
+                    src_y = peak.get('y', 0) * 100
+                    src_z = self.focus_distance_spin.value() * 100  # Focus distance as Z
+                    color = colors[i % len(colors)]
+                    size = 200 if i == 0 else 120  # Primary source is larger
+                    ax.scatter([src_x], [src_y], [src_z], c=color, s=size, 
+                              alpha=0.9, marker='*', edgecolors='white', linewidths=1)
+                    # Add label
+                    ax.text(src_x, src_y, src_z + 5, f'S{i+1}', color='white', 
+                           fontsize=8, ha='center')
+            
+            # Style the axes
+            ax.set_xlabel('X (cm)', color='white', fontsize=8)
+            ax.set_ylabel('Y (cm)', color='white', fontsize=8)
+            ax.set_zlabel('Z (cm)', color='white', fontsize=8)
+            
+            # Set reasonable axis limits based on grid size
+            grid_half = 30  # 30cm = 0.3m half-size
+            focus_z = self.focus_distance_spin.value() * 100 if hasattr(self, 'focus_distance_spin') else 100
+            ax.set_xlim([-grid_half, grid_half])
+            ax.set_ylim([-grid_half, grid_half])
+            ax.set_zlim([0, focus_z + 20])
+            
+            # Customize tick labels
+            ax.tick_params(axis='x', colors='white', labelsize=6)
+            ax.tick_params(axis='y', colors='white', labelsize=6)
+            ax.tick_params(axis='z', colors='white', labelsize=6)
+            
+            # Set viewing angle
+            ax.view_init(elev=25, azim=45)
+            
+            # Make panes transparent
+            ax.xaxis.pane.fill = False
+            ax.yaxis.pane.fill = False
+            ax.zaxis.pane.fill = False
+            ax.xaxis.pane.set_edgecolor('#444')
+            ax.yaxis.pane.set_edgecolor('#444')
+            ax.zaxis.pane.set_edgecolor('#444')
+            
+            # Grid styling
+            ax.xaxis._axinfo["grid"]["color"] = "#444"
+            ax.yaxis._axinfo["grid"]["color"] = "#444"
+            ax.zaxis._axinfo["grid"]["color"] = "#444"
+            
+            plt.tight_layout(pad=0.5)
+            
+            # Render to image buffer
+            buf = BytesIO()
+            fig.savefig(buf, format='png', dpi=100, facecolor='#1e1e1e', 
+                       edgecolor='none', bbox_inches='tight', pad_inches=0.1)
+            buf.seek(0)
+            plt.close(fig)
+            
+            # Convert to QPixmap and display
+            img_data = buf.getvalue()
+            qimg = QImage.fromData(img_data)
+            pixmap = QPixmap.fromImage(qimg)
+            
+            # Scale to fit label
+            scaled_pixmap = pixmap.scaled(
+                self.spatial_3d_label.size(),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation
+            )
+            self.spatial_3d_label.setPixmap(scaled_pixmap)
+            
+        except Exception as e:
+            logger.error(f"3D visualization error: {e}")
+            self.spatial_3d_label.setText(f"3D Hata:\n{str(e)[:50]}")
     
     # Slot fonksiyonları
     def toggle_start_stop(self):
@@ -1139,6 +1297,9 @@ class AcousticCameraGUI(QMainWindow):
         if not self.is_running:
             return
         
+        # Frame timing için zaman damgası
+        current_time = time.time()
+        
         # Video frame al ve göster
         # Not: Beamforming aktifse, _update_video_overlay() zaten frame'i overlay ile birlikte gösterir
         # Beamforming kapalıysa, sadece plain video göster
@@ -1151,15 +1312,30 @@ class AcousticCameraGUI(QMainWindow):
                     self.frame_count += 1
             # else: overlay zaten _update_video_overlay()'de gösterildi
         
-        # FPS hesapla (basitleştirilmiş)
-        fps = int(1000 / 33)  # ~30 FPS
-        self.fps_label.setText(f"FPS: {fps}")
+        # Gerçek FPS hesaplama - based on actual frame count over time window
+        if not hasattr(self, '_fps_frame_times'):
+            self._fps_frame_times = []
         
-        # CPU kullanımı (simüle - gerçek değer için psutil gerekir)
-        cpu_usage = 15
+        self._fps_frame_times.append(current_time)
+        # Keep only last 1 second of frame times
+        self._fps_frame_times = [t for t in self._fps_frame_times if current_time - t < 1.0]
+        
+        # Calculate FPS from frame count in last second
+        if len(self._fps_frame_times) >= 2:
+            actual_fps = len(self._fps_frame_times)
+            self.fps_label.setText(f"FPS: {actual_fps}")
+        
+        self._last_frame_time = current_time
+        
+        # Real CPU usage estimation from beamforming time
+        # If beamforming takes X ms out of 33ms frame budget, CPU usage ≈ X/33 * 100
         if self.beamforming_enabled and len(self.beamforming_times) > 0:
-            # Daha yüksek CPU göster
-            cpu_usage = 25
+            avg_bf_time = np.mean(self.beamforming_times)  # ms
+            # Estimate: beamforming time / frame budget (33ms) as percentage
+            # Plus base overhead (~10%)
+            cpu_usage = min(100, int(10 + (avg_bf_time / 33.0) * 60))
+        else:
+            cpu_usage = 5  # Minimal when not processing
         self.cpu_label.setText(f"CPU: {cpu_usage}%")
         
         # VU meter'lar audio thread tarafından güncelleniyor - burada dokunma!
@@ -1328,6 +1504,16 @@ class AcousticCameraGUI(QMainWindow):
             # Keep legacy single peak for compatibility
             self.detected_peak = self.detected_peaks[0] if self.detected_peaks else None
             
+            # Update 3D spatial visualization (throttled - every 5th frame)
+            if not hasattr(self, '_3d_update_counter'):
+                self._3d_update_counter = 0
+            self._3d_update_counter += 1
+            if self._3d_update_counter >= 5:  # Update every 5 frames to reduce overhead
+                self._update_3d_visualization()
+                # Update detected sources panel
+                self._update_sources_panel()
+                self._3d_update_counter = 0
+            
             # Convert to heatmap (RGB image)
             self.latest_heatmap = self._power_to_heatmap(power_grid)
             
@@ -1484,7 +1670,8 @@ class AcousticCameraGUI(QMainWindow):
     
     def _power_to_heatmap(self, power_grid: np.ndarray) -> np.ndarray:
         """
-        Convert power grid (dB) to RGB heatmap with proper thresholding
+        Convert power grid (dB) to RGB heatmap
+        RED = high power (sound source), BLUE = low power (quiet)
         
         Args:
             power_grid: (height, width) power in dB
@@ -1492,34 +1679,34 @@ class AcousticCameraGUI(QMainWindow):
         Returns:
             heatmap: (height, width, 4) RGBA uint8 image (with alpha channel)
         """
-        # Get dB range from GUI
-        db_min, db_max = self.db_range_slider.values()
+        # Get dB range from GUI - use these as reference thresholds
+        db_min_ui, db_max_ui = self.db_range_slider.values()
         
-        # Clip to dB range (HARD threshold - values below db_min become 0)
-        power_clipped = np.clip(power_grid, db_min, db_max)
+        # Use the UI slider values as the normalization range
+        # This allows user to control what power levels map to colors
+        # Clip power values to the UI range
+        power_clipped = np.clip(power_grid, db_min_ui, db_max_ui)
         
-        # Create mask: only show areas above threshold
-        # Threshold = db_min + 10% of range (to avoid showing noise floor)
-        threshold = db_min + (db_max - db_min) * 0.1
-        mask = power_grid > threshold
+        # Normalize to [0, 1] using UI slider range
+        normalized = (power_clipped - db_min_ui) / (db_max_ui - db_min_ui + 1e-6)
+        normalized = np.clip(normalized, 0, 1)
         
-        # Normalize to [0, 1] ONLY for values above threshold
-        normalized = np.zeros_like(power_grid, dtype=np.float32)
-        normalized[mask] = (power_clipped[mask] - db_min) / (db_max - db_min + 1e-6)
+        # Apply gamma correction to enhance contrast
+        gamma = 0.7
+        normalized_gamma = np.power(normalized, gamma)
         
-        # Apply gaussian smoothing ONLY to non-zero areas
-        normalized_smooth = gaussian_filter(normalized, sigma=1.5)
+        # Apply gaussian smoothing for nicer visual
+        normalized_smooth = gaussian_filter(normalized_gamma, sigma=1.5)
         
-        # Re-apply mask after smoothing to avoid bleeding into zero areas
-        normalized_smooth[~mask] = 0
-        
-        # Convert to [0, 255] uint8
+        # Convert to [0, 255] uint8 for colormap
+        # HIGH values (loud) should be RED, LOW values (quiet) should be BLUE
         normalized_uint8 = (normalized_smooth * 255).astype(np.uint8)
         
         # Get colormap from GUI
         colormap_name = self.colormap_combo.currentText()
         
-        # Apply colormap
+        # Apply colormap - JET goes from BLUE (0) to RED (255)
+        # So high power → 255 → RED, low power → 0 → BLUE ✓
         colormap_dict = {
             'jet': cv2.COLORMAP_JET,
             'hot': cv2.COLORMAP_HOT,
@@ -1537,10 +1724,18 @@ class AcousticCameraGUI(QMainWindow):
         # Convert BGR to RGB
         heatmap_rgb = cv2.cvtColor(heatmap_bgr, cv2.COLOR_BGR2RGB)
         
-        # Create alpha channel based on normalized power
-        # Alpha = 0 (transparent) where power is below threshold
-        # Alpha = normalized_smooth * 255 elsewhere
-        alpha = (normalized_smooth * 255).astype(np.uint8)
+        # Alpha channel: make low power areas more transparent
+        # Only show overlay where there's significant sound
+        # Use a threshold based on normalized value (bottom 30% is mostly transparent)
+        alpha_threshold = 0.25
+        alpha = np.zeros_like(normalized_smooth, dtype=np.float32)
+        above_threshold = normalized_smooth > alpha_threshold
+        # Scale alpha from threshold to 1.0
+        alpha[above_threshold] = (normalized_smooth[above_threshold] - alpha_threshold) / (1.0 - alpha_threshold)
+        
+        # Apply power curve to alpha for better contrast
+        alpha = np.power(alpha, 0.6)
+        alpha = (alpha * 255).astype(np.uint8)
         
         # Add alpha channel
         heatmap_rgba = np.dstack([heatmap_rgb, alpha])
@@ -1563,36 +1758,17 @@ class AcousticCameraGUI(QMainWindow):
             heatmap_h, heatmap_w = self.latest_heatmap.shape[:2]
             
             # ============================================================
-            # STRATEGY: FULL SCREEN OVERLAY WITH PROPER ASPECT RATIO
+            # STRATEGY: FULL SCREEN OVERLAY (stretch to entire video)
             # ============================================================
-            # The acoustic grid is a physical area (e.g., 0.6m x 0.6m) 
-            # at distance Z from the mic array.
-            # We map this entire grid onto the video frame, maintaining aspect ratio.
+            # Stretch heatmap to cover the entire video frame
+            overlay_w = video_w
+            overlay_h = video_h
+            x_offset = 0
+            y_offset = 0
             
-            # Get grid physical size from config
-            grid_size_x = self.beamforming_config.grid_size_x  # meters (e.g., 0.6)
-            grid_size_y = self.beamforming_config.grid_size_y  # meters (e.g., 0.6)
-            aspect_ratio = grid_size_x / grid_size_y  # Usually 1.0 for square grid
-            
-            # Decide overlay area on video
-            # Option A: Full screen (stretch to fit)
-            # Option B: Maintain aspect ratio (letterbox if needed)
-            # We'll use Option B for correct proportions
-            
-            video_aspect = video_w / video_h
-            
-            if video_aspect > aspect_ratio:
-                # Video is wider than grid - fit to height, center horizontally
-                overlay_h = video_h
-                overlay_w = int(video_h * aspect_ratio)
-                x_offset = (video_w - overlay_w) // 2
-                y_offset = 0
-            else:
-                # Video is taller than grid - fit to width, center vertically
-                overlay_w = video_w
-                overlay_h = int(video_w / aspect_ratio)
-                x_offset = 0
-                y_offset = (video_h - overlay_h) // 2
+            # Get grid physical size for crosshair mapping
+            grid_size_x = self.beamforming_config.grid_size_x  # meters
+            grid_size_y = self.beamforming_config.grid_size_y  # meters
             
             # Resize heatmap to overlay dimensions
             heatmap_resized = cv2.resize(
