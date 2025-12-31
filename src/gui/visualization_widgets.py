@@ -7,6 +7,7 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QLinearGradient, QColor, QBrush
 from scipy import signal
 import logging
 
@@ -216,8 +217,8 @@ class WaveformWidget(QWidget):
     """
     Real-time FFT Spectrum Widget (Frequency Domain)
     - Anlık FFT spektrum gösterimi (hangi frekansta ne kadar ses var)
-    - Dikey çubuklar ile frekans-genlik grafiği
-    - Geçmişe kayma YOK - sadece o anki frekans dağılımı
+    - Logaritmik X ekseni, koyu tema, gradyan dolgu
+    - Crosshair ile interaktif frekans/güç gösterimi
     """
     
     def __init__(self, sample_rate=48000, fft_size=2048):
@@ -233,9 +234,13 @@ class WaveformWidget(QWidget):
         # Selected channel
         self.selected_channel = 0  # 0 = average, 1-16 = specific
         
+        # Crosshair data
+        self.current_freqs = None
+        self.current_fft_db = None
+        
         self._init_ui()
         
-        logger.info("FFT Spectrum Widget initialized")
+        logger.info("FFT Spectrum Widget initialized (Dark Theme + Logarithmic)")
     
     def _init_ui(self):
         """UI bileşenlerini oluştur"""
@@ -256,37 +261,85 @@ class WaveformWidget(QWidget):
         control_layout.addWidget(self.channel_combo)
         control_layout.addStretch()
         
-        # Info label
-        self.info_label = QLabel("Waveform hazır")
-        self.info_label.setStyleSheet("color: #888; font-size: 10px;")
+        # Info label (crosshair değerlerini gösterir)
+        self.info_label = QLabel("Frekans: - Hz | Güç: - dB")
+        self.info_label.setStyleSheet("color: #00FFFF; font-size: 11px; font-weight: bold;")
         control_layout.addWidget(self.info_label)
         
         layout.addLayout(control_layout)
         
-        # PyQtGraph plot widget
+        # PyQtGraph plot widget - DARK THEME
         pg.setConfigOptions(antialias=True)
         self.plot_widget = pg.PlotWidget()
-        self.plot_widget.setBackground('w')  # Beyaz background (referans görseldeki gibi)
-        self.plot_widget.setLabel('left', 'Güç (dB)', color='k')
-        self.plot_widget.setLabel('bottom', 'Frekans', units='Hz', color='k')
-        self.plot_widget.setTitle('FFT Spektrum', color='k', size='11pt')
+        self.plot_widget.setBackground('#1a1a2e')  # Koyu mavi-siyah arkaplan
+        self.plot_widget.setLabel('left', 'Güç (dB)', color='#cccccc')
+        self.plot_widget.setLabel('bottom', 'Frekans', units='Hz', color='#cccccc')
+        self.plot_widget.setTitle('FFT Spektrum', color='#ffffff', size='11pt')
         self.plot_widget.setYRange(-80, 0)
-        self.plot_widget.setLogMode(x=False, y=False)
-        self.plot_widget.showGrid(x=True, y=True, alpha=0.2)
         
-        # Ana spektrum çizgisi (mavi line + fill)
+        # Logaritmik X ekseni
+        self.plot_widget.setLogMode(x=True, y=False)
+        self.plot_widget.setXRange(np.log10(20), np.log10(20000))  # 20 Hz - 20 kHz
+        
+        # Grid çizgileri - ince ve gri
+        self.plot_widget.showGrid(x=True, y=True, alpha=0.15)
+        self.plot_widget.getAxis('bottom').setStyle(tickTextOffset=5)
+        self.plot_widget.getAxis('left').setStyle(tickTextOffset=5)
+        
+        # Gradyan dolgu için brush oluştur (Cyan'dan Transparent Mavi'ye)
+        gradient = QLinearGradient(0, 0, 0, 1)
+        gradient.setCoordinateMode(QLinearGradient.ObjectBoundingMode)
+        gradient.setColorAt(0, QColor(0, 255, 255, 180))   # Parlak Cyan (üst)
+        gradient.setColorAt(0.5, QColor(0, 150, 255, 100)) # Mavi
+        gradient.setColorAt(1, QColor(0, 80, 150, 30))     # Transparent Mavi (alt)
+        
+        # Ana spektrum eğrisi (gradyan dolgu ile)
         self.spectrum_curve = self.plot_widget.plot(
-            pen=pg.mkPen(color=(70, 130, 220), width=2),  # Mavi çizgi
-            fillLevel=-80,  # Bottom'dan doldur
-            brush=(70, 130, 220, 80)  # Soluk mavi fill
+            pen=pg.mkPen(color=(0, 255, 255), width=2),  # Cyan çizgi
+            fillLevel=-80,
+            brush=QBrush(gradient)
         )
         
-        # Peak hold çizgisi (soluk mavi line)
+        # Peak hold çizgisi (açık mor, kesikli)
         self.peak_curve = self.plot_widget.plot(
-            pen=pg.mkPen(color=(150, 180, 230), width=1.5, style=pg.QtCore.Qt.DashLine)
+            pen=pg.mkPen(color=(180, 100, 255), width=1.5, style=Qt.DashLine)
         )
+        
+        # Crosshair (kılavuz çizgileri)
+        self.vLine = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('#FFFF00', width=1))
+        self.hLine = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen('#FFFF00', width=1))
+        self.plot_widget.addItem(self.vLine, ignoreBounds=True)
+        self.plot_widget.addItem(self.hLine, ignoreBounds=True)
+        
+        # Mouse hareket takibi
+        self.proxy = pg.SignalProxy(self.plot_widget.scene().sigMouseMoved, rateLimit=60, slot=self._mouseMoved)
         
         layout.addWidget(self.plot_widget)
+    
+    def _mouseMoved(self, evt):
+        """Mouse hareket ettiğinde crosshair güncelle"""
+        pos = evt[0]
+        if self.plot_widget.sceneBoundingRect().contains(pos):
+            mousePoint = self.plot_widget.plotItem.vb.mapSceneToView(pos)
+            x = mousePoint.x()  # Logaritmik değer
+            y = mousePoint.y()
+            
+            # Crosshair pozisyonunu güncelle
+            self.vLine.setPos(x)
+            self.hLine.setPos(y)
+            
+            # Frekans değerini hesapla (logaritmik eksenden)
+            freq = 10 ** x
+            
+            # Eğer veri varsa, o frekanstaki gerçek dB değerini bul
+            if self.current_freqs is not None and self.current_fft_db is not None and len(self.current_freqs) > 0:
+                # En yakın frekans noktasını bul
+                idx = np.argmin(np.abs(self.current_freqs - freq))
+                actual_db = self.current_fft_db[idx]
+                actual_freq = self.current_freqs[idx]
+                self.info_label.setText(f"Frekans: {actual_freq:.0f} Hz | Güç: {actual_db:.1f} dB")
+            else:
+                self.info_label.setText(f"Frekans: {freq:.0f} Hz | Güç: {y:.1f} dB")
     
     def _on_channel_changed(self, index):
         """Kanal seçimi değiştiğinde"""
@@ -373,6 +426,10 @@ class WaveformWidget(QWidget):
             
             # Spektrum çizgisini çiz (line plot)
             if len(freqs) > 0:
+                # Crosshair için verileri sakla
+                self.current_freqs = freqs.copy()
+                self.current_fft_db = fft_db_smooth.copy()
+                
                 self.spectrum_curve.setData(freqs, fft_db_smooth)
                 self.peak_curve.setData(freqs, self.peak_data)
             
@@ -384,3 +441,264 @@ class WaveformWidget(QWidget):
         self.spectrum_curve.clear()
         self.peak_curve.clear()
         self.peak_data = None
+        self.current_freqs = None
+        self.current_fft_db = None
+
+
+# =============================================================================
+# SPATIAL 3D WIDGET - pyqtgraph.opengl based 3D Visualization
+# =============================================================================
+
+try:
+    import pyqtgraph.opengl as gl
+    OPENGL_AVAILABLE = True
+except ImportError:
+    OPENGL_AVAILABLE = False
+    logger.warning("pyqtgraph.opengl not available - 3D visualization disabled")
+
+
+class Spatial3DWidget(QWidget):
+    """
+    3D Spatial Visualization Widget
+    - Grid floor with microphone positions
+    - Glowing spheres for sound sources
+    - Laser vectors from mic array center to sources
+    - Orbiting camera with mouse control
+    """
+    
+    def __init__(self, mic_positions=None):
+        super().__init__()
+        
+        self.mic_positions = mic_positions  # Nx3 array
+        self.sources = []  # List of source data
+        
+        self._init_ui()
+        
+        logger.info("Spatial3DWidget initialized")
+    
+    def _init_ui(self):
+        """Initialize 3D view"""
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        if not OPENGL_AVAILABLE:
+            # Fallback if OpenGL not available
+            fallback_label = QLabel("3D Visualization requires OpenGL support")
+            fallback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            fallback_label.setStyleSheet("color: #888; font-size: 12px; padding: 20px;")
+            layout.addWidget(fallback_label)
+            return
+        
+        # Create 3D view
+        self.view = gl.GLViewWidget()
+        self.view.setBackgroundColor('#0a0a14')
+        self.view.setCameraPosition(distance=1.5, elevation=30, azimuth=45)
+        layout.addWidget(self.view)
+        
+        # Add grid floor
+        self._add_grid_floor()
+        
+        # Add microphone positions
+        self._add_microphone_array()
+        
+        # Placeholder for source items
+        self.source_items = []
+        self.laser_items = []
+    
+    def _add_grid_floor(self):
+        """Add reference grid on the floor"""
+        if not OPENGL_AVAILABLE:
+            return
+        
+        # Create grid
+        grid = gl.GLGridItem()
+        grid.setSize(x=2, y=2, z=0)
+        grid.setSpacing(x=0.1, y=0.1, z=0.1)
+        grid.translate(0, 0, -0.1)  # Slightly below origin
+        grid.setColor((0.2, 0.3, 0.4, 0.5))
+        self.view.addItem(grid)
+        
+        # Add axis lines
+        axis_data = np.array([
+            # X axis (red)
+            [[0, 0, 0], [0.3, 0, 0]],
+            # Y axis (green)
+            [[0, 0, 0], [0, 0.3, 0]],
+            # Z axis (blue)
+            [[0, 0, 0], [0, 0, 0.3]]
+        ])
+        
+        # X axis
+        x_axis = gl.GLLinePlotItem(pos=np.array([[0, 0, 0], [0.3, 0, 0]]), 
+                                    color=(1, 0.3, 0.3, 0.8), width=2)
+        self.view.addItem(x_axis)
+        
+        # Y axis
+        y_axis = gl.GLLinePlotItem(pos=np.array([[0, 0, 0], [0, 0.3, 0]]), 
+                                    color=(0.3, 1, 0.3, 0.8), width=2)
+        self.view.addItem(y_axis)
+        
+        # Z axis
+        z_axis = gl.GLLinePlotItem(pos=np.array([[0, 0, 0], [0, 0, 0.3]]), 
+                                    color=(0.3, 0.5, 1, 0.8), width=2)
+        self.view.addItem(z_axis)
+    
+    def _add_microphone_array(self):
+        """Add microphone positions as small points"""
+        if not OPENGL_AVAILABLE:
+            return
+        
+        if self.mic_positions is None:
+            # Default UMA-16 circular array (example)
+            n_mics = 16
+            radius = 0.04  # 4cm radius
+            angles = np.linspace(0, 2 * np.pi, n_mics, endpoint=False)
+            self.mic_positions = np.column_stack([
+                radius * np.cos(angles),
+                radius * np.sin(angles),
+                np.zeros(n_mics)
+            ])
+        
+        # Ensure mic_positions is Nx3
+        if self.mic_positions.ndim == 2:
+            if self.mic_positions.shape[1] == 2:
+                # Add z=0 if only 2D
+                z_vals = np.zeros((self.mic_positions.shape[0], 1))
+                self.mic_positions = np.hstack([self.mic_positions, z_vals])
+        
+        # Create microphone scatter points
+        mic_colors = np.ones((len(self.mic_positions), 4))
+        mic_colors[:, :3] = [0.3, 0.8, 1.0]  # Cyan
+        mic_colors[:, 3] = 0.9  # Alpha
+        
+        self.mic_scatter = gl.GLScatterPlotItem(
+            pos=self.mic_positions,
+            color=mic_colors,
+            size=8,
+            pxMode=True
+        )
+        self.view.addItem(self.mic_scatter)
+        
+        # Draw microphone array boundary circle
+        n_circle = 100
+        theta = np.linspace(0, 2 * np.pi, n_circle)
+        r = np.max(np.linalg.norm(self.mic_positions[:, :2], axis=1))
+        circle_pts = np.column_stack([
+            r * np.cos(theta),
+            r * np.sin(theta),
+            np.zeros(n_circle)
+        ])
+        
+        mic_circle = gl.GLLinePlotItem(pos=circle_pts, color=(0.3, 0.6, 0.8, 0.5), width=1)
+        self.view.addItem(mic_circle)
+    
+    def update_sources(self, sources):
+        """
+        Update sound source positions and intensities
+        
+        Args:
+            sources: List of dicts with keys:
+                - x, y: position in meters
+                - power_db: sound level in dB
+                - color: RGB tuple (0-255)
+                - index: source number
+        """
+        if not OPENGL_AVAILABLE:
+            return
+        
+        self.sources = sources
+        
+        # Remove old source items
+        for item in self.source_items:
+            self.view.removeItem(item)
+        for item in self.laser_items:
+            self.view.removeItem(item)
+        
+        self.source_items = []
+        self.laser_items = []
+        
+        if not sources:
+            return
+        
+        # Get mic array center
+        mic_center = np.mean(self.mic_positions, axis=0) if self.mic_positions is not None else np.array([0, 0, 0])
+        
+        for source in sources:
+            x = source.get('x', 0)
+            y = source.get('y', 0)
+            z = source.get('z', 0.5)  # Default z position (distance from array)
+            power_db = source.get('power_db', 0)
+            color_bgr = source.get('color', (0, 255, 0))
+            index = source.get('index', 1)
+            
+            # Convert BGR to RGB and normalize
+            color_rgb = (color_bgr[2] / 255.0, color_bgr[1] / 255.0, color_bgr[0] / 255.0)
+            
+            # Size based on power (larger = louder)
+            base_size = 15 if index == 1 else 10
+            size = base_size + max(0, (power_db + 60) / 5)  # Scale by power
+            
+            # Alpha based on power
+            alpha = min(1.0, 0.5 + (power_db + 60) / 100)
+            
+            # Source position
+            pos = np.array([[x, y, z]])
+            
+            # Create glowing sphere
+            source_scatter = gl.GLScatterPlotItem(
+                pos=pos,
+                color=(*color_rgb, alpha),
+                size=size,
+                pxMode=True
+            )
+            self.view.addItem(source_scatter)
+            self.source_items.append(source_scatter)
+            
+            # Create outer glow (larger, more transparent)
+            glow_scatter = gl.GLScatterPlotItem(
+                pos=pos,
+                color=(*color_rgb, alpha * 0.3),
+                size=size * 2,
+                pxMode=True
+            )
+            self.view.addItem(glow_scatter)
+            self.source_items.append(glow_scatter)
+            
+            # Create laser line from mic center to source
+            laser_pts = np.array([mic_center, [x, y, z]])
+            laser_color = (*color_rgb, 0.6)
+            
+            laser_line = gl.GLLinePlotItem(
+                pos=laser_pts,
+                color=laser_color,
+                width=2 if index == 1 else 1
+            )
+            self.view.addItem(laser_line)
+            self.laser_items.append(laser_line)
+    
+    def set_microphone_positions(self, positions):
+        """Update microphone positions"""
+        self.mic_positions = positions
+        
+        if OPENGL_AVAILABLE and hasattr(self, 'mic_scatter'):
+            # Ensure proper shape
+            if positions.ndim == 2:
+                if positions.shape[1] == 2:
+                    z_vals = np.zeros((positions.shape[0], 1))
+                    positions = np.hstack([positions, z_vals])
+            
+            self.mic_scatter.setData(pos=positions)
+    
+    def clear(self):
+        """Clear all sources"""
+        if not OPENGL_AVAILABLE:
+            return
+        
+        for item in self.source_items:
+            self.view.removeItem(item)
+        for item in self.laser_items:
+            self.view.removeItem(item)
+        
+        self.source_items = []
+        self.laser_items = []
+        self.sources = []

@@ -27,6 +27,7 @@ import logging
 import time
 from pathlib import Path
 from typing import Optional
+from datetime import datetime
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
@@ -34,7 +35,7 @@ from PySide6.QtWidgets import (
     QCheckBox, QSpinBox, QDoubleSpinBox, QStatusBar,
     QMenuBar, QFileDialog, QMessageBox,
     QSplitter, QFrame, QProgressBar, QTextEdit, QListWidget,
-    QScrollArea, QGridLayout
+    QScrollArea, QGridLayout, QSizePolicy
 )
 from PySide6.QtCore import Qt, QTimer, Signal, QThread, QSize
 from PySide6.QtGui import QImage, QPixmap, QPalette, QColor, QAction
@@ -43,7 +44,7 @@ import numpy as np
 import cv2
 
 from .custom_widgets import DoubleRangeSlider
-from .visualization_widgets import SpectrogramWidget, WaveformWidget
+from .visualization_widgets import SpectrogramWidget, WaveformWidget, Spatial3DWidget
 
 # Audio stream thread import
 import sys
@@ -77,6 +78,9 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from io import BytesIO
 
+# sounddevice for device listing
+import sounddevice as sd
+
 logger = logging.getLogger(__name__)
 
 
@@ -99,6 +103,11 @@ class AcousticCameraGUI(QMainWindow):
         # Timer'lar
         self.update_timer = QTimer()
         self.update_timer.timeout.connect(self.update_display)
+        
+        # Recording timer
+        self.record_timer = QTimer()
+        self.record_timer.timeout.connect(self._update_record_time)
+        self.record_start_time = None
         
         # Video capture
         self.video_capture = None
@@ -135,6 +144,16 @@ class AcousticCameraGUI(QMainWindow):
         # Performance monitoring
         self.beamforming_times = []  # Track processing times
         
+        # Recording variables
+        self.video_writer = None
+        self.audio_record_buffer = []
+        self.spectrogram_record_buffer = []
+        self.fft_record_buffer = []
+        
+        # Device info (for connected device names)
+        self.connected_audio_device_name = ""
+        self.connected_video_device_name = ""
+        
         # GUI bileşenlerini oluştur
         self._init_ui()
         self._init_menubar()
@@ -151,53 +170,103 @@ class AcousticCameraGUI(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
-        main_layout.setSpacing(5)
-        main_layout.setContentsMargins(5, 5, 5, 5)
+        main_layout.setSpacing(10)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        
+        # ========== ANA SPLITTER ==========
+        # Sol panel ve merkez+sağ panel arasında
+        self.main_splitter = QSplitter(Qt.Horizontal)
+        self.main_splitter.setHandleWidth(6)
+        self.main_splitter.setStyleSheet("""
+            QSplitter::handle {
+                background-color: #3d3d5c;
+                border-radius: 3px;
+            }
+            QSplitter::handle:hover {
+                background-color: #5c5c8a;
+            }
+        """)
         
         # Sol panel: Kontroller - scrollable
         left_scroll = QScrollArea()
         left_scroll.setWidgetResizable(True)
-        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)  # Yatay scroll gerekirse göster
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)  # Yatay scroll kapalı
         left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        left_scroll.setMinimumWidth(350)
+        left_scroll.setMaximumWidth(500)
+        left_scroll.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        
         control_panel = self._create_control_panel()
+        control_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         left_scroll.setWidget(control_panel)
-        left_scroll.setMaximumWidth(450)  # Biraz daha geniş
-        left_scroll.setMinimumWidth(380)
-        main_layout.addWidget(left_scroll)
+        
+        # Sağ taraf için dikey splitter (merkez + sağ panel)
+        right_splitter = QSplitter(Qt.Horizontal)
+        right_splitter.setHandleWidth(6)
+        right_splitter.setStyleSheet("""
+            QSplitter::handle {
+                background-color: #3d3d5c;
+                border-radius: 3px;
+            }
+        """)
         
         # Orta: Video + Overlay + Spektrogram
         center_panel = self._create_center_panel()
-        main_layout.addWidget(center_panel, stretch=3)
         
         # Sağ: Analiz panelleri + VU Meters - scrollable
         right_scroll = QScrollArea()
         right_scroll.setWidgetResizable(True)
-        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         right_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        right_scroll.setMinimumWidth(320)
+        right_scroll.setMaximumWidth(450)
+        right_scroll.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        
         right_panel = self._create_right_panel()
+        right_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         right_scroll.setWidget(right_panel)
-        right_scroll.setMaximumWidth(420)
-        right_scroll.setMinimumWidth(350)
-        main_layout.addWidget(right_scroll)
+        
+        # Splitter'lara ekle
+        right_splitter.addWidget(center_panel)
+        right_splitter.addWidget(right_scroll)
+        right_splitter.setStretchFactor(0, 3)  # Merkez daha geniş
+        right_splitter.setStretchFactor(1, 1)
+        
+        self.main_splitter.addWidget(left_scroll)
+        self.main_splitter.addWidget(right_splitter)
+        self.main_splitter.setStretchFactor(0, 0)  # Sol panel sabit
+        self.main_splitter.setStretchFactor(1, 1)  # Sağ taraf esnek
+        
+        main_layout.addWidget(self.main_splitter)
     
     def _create_control_panel(self) -> QWidget:
         """Sol kontrol panelini oluştur"""
         panel = QWidget()
         layout = QVBoxLayout(panel)
+        layout.setSpacing(12)
+        layout.setContentsMargins(10, 10, 10, 10)
         
         # 1. BAĞLANTI AYARLARI
         conn_group = self._create_connection_group()
         layout.addWidget(conn_group)
         
-        # 2. SES AYARLARI
-        audio_group = self._create_audio_group()
-        layout.addWidget(audio_group)
-        
-        # 3. PARAMETRELER & ALGORİTMALAR (Beamforming + Görselleştirme birleştirildi)
+        # 2. PARAMETRELER & ALGORİTMALAR (Beamforming) - Ses Ayarlarından Önce
         params_group = self._create_parameters_algorithms_group()
         layout.addWidget(params_group)
         
-        # 4. KAYIT & DOSYA YÜKLEME
+        # 3. SES AYARLARI
+        audio_group = self._create_audio_group()
+        layout.addWidget(audio_group)
+        
+        # 4. OVERLAY AYARLARI (Ayrı grup)
+        overlay_group = self._create_overlay_group()
+        layout.addWidget(overlay_group)
+        
+        # 5. RENK HARİTASI (En altta)
+        colormap_group = self._create_colormap_group()
+        layout.addWidget(colormap_group)
+        
+        # 6. KAYIT & DOSYA YÜKLEME
         file_group = self._create_file_operations_group()
         layout.addWidget(file_group)
         
@@ -207,29 +276,49 @@ class AcousticCameraGUI(QMainWindow):
         return panel
     
     def _create_connection_group(self) -> QGroupBox:
-        """Bağlantı ayarları grubu"""
+        """Bağlantı ayarları grubu - Sistemdeki gerçek cihazları listeler"""
         group = QGroupBox("🔌 Bağlantı Ayarları")
         layout = QVBoxLayout()
+        layout.setSpacing(8)
+        layout.setContentsMargins(10, 15, 10, 10)
         
-        # Audio cihaz seçimi
-        layout.addWidget(QLabel("Audio Cihazı:"))
+        # Mikrofon cihaz seçimi - Sistemdeki cihazları listele
+        layout.addWidget(QLabel("Mikrofon:"))
         self.audio_device_combo = QComboBox()
-        self.audio_device_combo.addItems(["UMA16v2 (Auto)", "Manuel Seçim..."])
+        self.audio_device_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._populate_audio_devices()
         layout.addWidget(self.audio_device_combo)
         
-        # Video cihaz seçimi
-        layout.addWidget(QLabel("Video Cihazı:"))
+        # Refresh audio devices button
+        refresh_audio_btn = QPushButton("🔄 Mikrofon Listesini Yenile")
+        refresh_audio_btn.clicked.connect(lambda: self._populate_audio_devices())
+        layout.addWidget(refresh_audio_btn)
+        
+        # Video cihaz seçimi - Sistemdeki kameraları listele
+        layout.addWidget(QLabel("Kamera:"))
         self.video_device_combo = QComboBox()
-        self.video_device_combo.addItems(["Webcam 0", "Webcam 1", "Webcam 2", "Webcam 3"])
+        self.video_device_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._populate_video_devices()
         layout.addWidget(self.video_device_combo)
         
-        # Bağlantı durumu
-        status_layout = QHBoxLayout()
-        self.audio_status_label = QLabel("🔴 Audio: Bağlı değil")
-        self.video_status_label = QLabel("🔴 Video: Bağlı değil")
+        # Refresh video devices button
+        refresh_video_btn = QPushButton("🔄 Kamera Listesini Yenile")
+        refresh_video_btn.clicked.connect(lambda: self._populate_video_devices())
+        layout.addWidget(refresh_video_btn)
+        
+        # Bağlantı durumu - tek satırda özet
+        status_frame = QFrame()
+        status_frame.setFrameShape(QFrame.StyledPanel)
+        status_frame.setStyleSheet("background-color: #2b2b3d; border-radius: 5px; padding: 5px;")
+        status_layout = QVBoxLayout(status_frame)
+        status_layout.setSpacing(2)
+        status_layout.setContentsMargins(8, 6, 8, 6)
+        
+        self.audio_status_label = QLabel("🔴 Mikrofon: Bağlı değil")
+        self.video_status_label = QLabel("🔴 Kamera: Bağlı değil")
         status_layout.addWidget(self.audio_status_label)
         status_layout.addWidget(self.video_status_label)
-        layout.addLayout(status_layout)
+        layout.addWidget(status_frame)
         
         # Başlat/Durdur butonu
         self.start_stop_btn = QPushButton("▶️ BAŞLAT")
@@ -255,15 +344,77 @@ class AcousticCameraGUI(QMainWindow):
         group.setLayout(layout)
         return group
     
+    def _populate_audio_devices(self):
+        """Sistemdeki audio cihazlarını listele"""
+        self.audio_device_combo.clear()
+        uma_index = -1
+        try:
+            # Cihaz listesini yenile (cache'i temizle)
+            sd._terminate()
+            sd._initialize()
+            
+            devices = sd.query_devices()
+            combo_idx = 0
+            for i, device in enumerate(devices):
+                # Sadece input cihazlarını göster
+                if device['max_input_channels'] > 0:
+                    name = device['name']
+                    channels = device['max_input_channels']
+                    display_name = f"{name} ({channels}ch)"
+                    self.audio_device_combo.addItem(display_name, i)
+                    
+                    # UMA-16'yı bul
+                    if 'uma' in name.lower():
+                        uma_index = combo_idx
+                    combo_idx += 1
+            
+            # UMA-16 varsa onu seç
+            if uma_index >= 0:
+                self.audio_device_combo.setCurrentIndex(uma_index)
+            
+            logger.info(f"Mikrofon listesi güncellendi: {combo_idx} cihaz bulundu")
+                
+        except Exception as e:
+            logger.error(f"Mikrofon cihazları listelenemedi: {e}")
+            self.audio_device_combo.addItem("Cihaz bulunamadı", -1)
+    
+    def _populate_video_devices(self):
+        """Sistemdeki video cihazlarını listele"""
+        self.video_device_combo.clear()
+        
+        # macOS'ta kamera isimlerini almak için
+        available_cameras = []
+        for i in range(5):  # İlk 5 kamera index'ini kontrol et
+            cap = cv2.VideoCapture(i)
+            if cap.isOpened():
+                # Backend bilgisini al
+                backend = cap.getBackendName()
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                
+                # macOS'ta kamera ismini almak zor, index kullan
+                camera_name = f"Kamera {i} ({width}x{height})"
+                available_cameras.append((i, camera_name))
+                cap.release()
+        
+        if available_cameras:
+            for idx, name in available_cameras:
+                self.video_device_combo.addItem(name, idx)
+        else:
+            self.video_device_combo.addItem("Kamera bulunamadı", -1)
+    
     def _create_audio_group(self) -> QGroupBox:
         """Ses işleme ayarları grubu"""
         group = QGroupBox("🎤 Ses Ayarları")
         layout = QVBoxLayout()
+        layout.setSpacing(8)
+        layout.setContentsMargins(10, 15, 10, 10)
         
         # Sample rate
         layout.addWidget(QLabel("Örnekleme Hızı:"))
         self.sample_rate_combo = QComboBox()
         self.sample_rate_combo.addItems(["48000 Hz", "44100 Hz", "96000 Hz"])
+        self.sample_rate_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         layout.addWidget(self.sample_rate_combo)
         
         # Chunk size
@@ -272,16 +423,19 @@ class AcousticCameraGUI(QMainWindow):
         self.chunk_size_spin.setRange(512, 8192)
         self.chunk_size_spin.setValue(4096)
         self.chunk_size_spin.setSingleStep(512)
+        self.chunk_size_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         layout.addWidget(self.chunk_size_spin)
         
         # Filtreleme
         filter_layout = QHBoxLayout()
+        filter_layout.setSpacing(15)
         self.highpass_check = QCheckBox("Highpass")
         self.highpass_check.setChecked(True)
         self.lowpass_check = QCheckBox("Lowpass")
         self.lowpass_check.setChecked(True)
         filter_layout.addWidget(self.highpass_check)
         filter_layout.addWidget(self.lowpass_check)
+        filter_layout.addStretch()
         layout.addLayout(filter_layout)
         
         # Highpass cutoff
@@ -289,6 +443,7 @@ class AcousticCameraGUI(QMainWindow):
         self.highpass_spin = QSpinBox()
         self.highpass_spin.setRange(10, 1000)
         self.highpass_spin.setValue(100)
+        self.highpass_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         layout.addWidget(self.highpass_spin)
         
         # Lowpass cutoff
@@ -296,39 +451,48 @@ class AcousticCameraGUI(QMainWindow):
         self.lowpass_spin = QSpinBox()
         self.lowpass_spin.setRange(1000, 24000)
         self.lowpass_spin.setValue(10000)
+        self.lowpass_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         layout.addWidget(self.lowpass_spin)
         
         group.setLayout(layout)
         return group
     
     def _create_parameters_algorithms_group(self) -> QGroupBox:
-        """Parametreler & Algoritmalar - Beamforming + Görselleştirme birleştirildi"""
+        """Parametreler & Algoritmalar - Beamforming ayarları"""
         group = QGroupBox("⚙️ Parametreler & Algoritmalar")
         layout = QVBoxLayout()
+        layout.setSpacing(8)
+        layout.setContentsMargins(10, 15, 10, 10)
         
         # --- GÖRSELLEŞTİRME AÇMA/KAPAMA ---
         layout.addWidget(QLabel("<b>Görselleştirme Kontrol:</b>"))
         
         viz_control_layout = QVBoxLayout()
-        self.enable_spectrogram_check = QCheckBox("✓ Spektrogram Aktif")
+        viz_control_layout.setSpacing(6)
+        
+        self.enable_spectrogram_check = QCheckBox("Spektrogram Aktif")
         self.enable_spectrogram_check.setChecked(True)
         self.enable_spectrogram_check.setToolTip("Spektrogramı aç/kapat (CPU tasarrufu)")
         viz_control_layout.addWidget(self.enable_spectrogram_check)
         
-        self.enable_fft_check = QCheckBox("✓ FFT Spektrum Aktif")
+        self.enable_fft_check = QCheckBox("FFT Spektrum Aktif")
         self.enable_fft_check.setChecked(True)
         self.enable_fft_check.setToolTip("FFT spektrumunu aç/kapat (CPU tasarrufu)")
         viz_control_layout.addWidget(self.enable_fft_check)
         
-        self.enable_beamforming_check = QCheckBox("🎯 Beamforming & Overlay Aktif")
+        self.enable_beamforming_check = QCheckBox("Beamforming Aktif")
         self.enable_beamforming_check.setChecked(False)  # Başlangıçta kapalı
-        self.enable_beamforming_check.setToolTip("Akustik görüntüleme ve video overlay'i aç/kapat")
+        self.enable_beamforming_check.setToolTip("Akustik görüntüleme hesaplamasını aç/kapat")
         self.enable_beamforming_check.stateChanged.connect(self._on_beamforming_toggle)
         viz_control_layout.addWidget(self.enable_beamforming_check)
         
         layout.addLayout(viz_control_layout)
         
-        layout.addWidget(QLabel("─" * 30))
+        # Separator
+        separator = QFrame()
+        separator.setFrameShape(QFrame.HLine)
+        separator.setStyleSheet("background-color: #3d3d5c;")
+        layout.addWidget(separator)
         
         # Algoritma seçimi
         layout.addWidget(QLabel("Algoritma:"))
@@ -340,6 +504,7 @@ class AcousticCameraGUI(QMainWindow):
             "CLEAN-SC"
         ])
         self.algorithm_combo.currentTextChanged.connect(self._on_algorithm_changed)
+        self.algorithm_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         layout.addWidget(self.algorithm_combo)
         
         # Number of sources (for MUSIC algorithm)
@@ -348,6 +513,7 @@ class AcousticCameraGUI(QMainWindow):
         self.n_sources_spin.setRange(1, 10)
         self.n_sources_spin.setValue(1)
         self.n_sources_spin.setToolTip("MUSIC algoritması için beklenen kaynak sayısı")
+        self.n_sources_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         layout.addWidget(self.n_sources_spin)
         
         # Frekans aralığı - DOUBLE RANGE SLIDER
@@ -372,6 +538,7 @@ class AcousticCameraGUI(QMainWindow):
         self.grid_resolution_spin.setSingleStep(0.5)
         self.grid_resolution_spin.setDecimals(1)
         self.grid_resolution_spin.setSuffix(" cm")
+        self.grid_resolution_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         layout.addWidget(self.grid_resolution_spin)
         
         # Z mesafesi (odak mesafesi)
@@ -381,35 +548,14 @@ class AcousticCameraGUI(QMainWindow):
         self.focus_distance_spin.setValue(1.0)
         self.focus_distance_spin.setSingleStep(0.1)
         self.focus_distance_spin.setDecimals(2)
+        self.focus_distance_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         layout.addWidget(self.focus_distance_spin)
         
-        # --- GÖRSELLEŞTIRME ---
-        layout.addWidget(QLabel("─" * 30))
-        
-        # Renk haritası
-        layout.addWidget(QLabel("Renk Haritası:"))
-        self.colormap_combo = QComboBox()
-        self.colormap_combo.addItems([
-            "jet", "hot", "viridis", "plasma", "inferno",
-            "coolwarm", "rainbow", "turbo"
-        ])
-        layout.addWidget(self.colormap_combo)
-        
-        # Overlay alpha
-        layout.addWidget(QLabel("Overlay Şeffaflığı:"))
-        self.alpha_slider = QSlider(Qt.Horizontal)
-        self.alpha_slider.setRange(0, 100)
-        self.alpha_slider.setValue(60)
-        self.alpha_value_label = QLabel("60%")
-        self.alpha_slider.valueChanged.connect(
-            lambda v: self.alpha_value_label.setText(f"{v}%")
-        )
-        layout.addWidget(self.alpha_slider)
-        layout.addWidget(self.alpha_value_label)
-        
         # Görselleştirme seçenekleri
+        layout.addWidget(QLabel("<b>Gösterim Seçenekleri:</b>"))
         self.show_contours_check = QCheckBox("Kontur çizgileri")
         self.show_peaks_check = QCheckBox("Peak noktaları")
+        self.show_peaks_check.setChecked(True)
         self.show_grid_check = QCheckBox("Grid göster")
         layout.addWidget(self.show_contours_check)
         layout.addWidget(self.show_peaks_check)
@@ -418,10 +564,62 @@ class AcousticCameraGUI(QMainWindow):
         group.setLayout(layout)
         return group
     
+    def _create_overlay_group(self) -> QGroupBox:
+        """Overlay ayarları grubu - ayrı"""
+        group = QGroupBox("🎨 Overlay Ayarları")
+        layout = QVBoxLayout()
+        layout.setSpacing(8)
+        layout.setContentsMargins(10, 15, 10, 10)
+        
+        # Overlay aktif/deaktif
+        self.enable_overlay_check = QCheckBox("Video Overlay Aktif")
+        self.enable_overlay_check.setChecked(True)
+        self.enable_overlay_check.setToolTip("Akustik ısı haritasını video üzerine bindirmeyi aç/kapat")
+        layout.addWidget(self.enable_overlay_check)
+        
+        # Overlay alpha
+        layout.addWidget(QLabel("Overlay Şeffaflığı:"))
+        alpha_layout = QHBoxLayout()
+        self.alpha_slider = QSlider(Qt.Horizontal)
+        self.alpha_slider.setRange(0, 100)
+        self.alpha_slider.setValue(60)
+        self.alpha_value_label = QLabel("60%")
+        self.alpha_value_label.setMinimumWidth(40)
+        self.alpha_slider.valueChanged.connect(
+            lambda v: self.alpha_value_label.setText(f"{v}%")
+        )
+        alpha_layout.addWidget(self.alpha_slider)
+        alpha_layout.addWidget(self.alpha_value_label)
+        layout.addLayout(alpha_layout)
+        
+        group.setLayout(layout)
+        return group
+    
+    def _create_colormap_group(self) -> QGroupBox:
+        """Renk haritası grubu - en altta"""
+        group = QGroupBox("🌈 Renk Haritası")
+        layout = QVBoxLayout()
+        layout.setSpacing(8)
+        layout.setContentsMargins(10, 15, 10, 10)
+        
+        layout.addWidget(QLabel("Renk Paleti:"))
+        self.colormap_combo = QComboBox()
+        self.colormap_combo.addItems([
+            "jet", "hot", "viridis", "plasma", "inferno",
+            "coolwarm", "rainbow", "turbo"
+        ])
+        self.colormap_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        layout.addWidget(self.colormap_combo)
+        
+        group.setLayout(layout)
+        return group
+    
     def _create_file_operations_group(self) -> QGroupBox:
         """Dosya işlemleri: Kayıt + Yükleme"""
         group = QGroupBox("💾 Dosya İşlemleri")
         layout = QVBoxLayout()
+        layout.setSpacing(8)
+        layout.setContentsMargins(10, 15, 10, 10)
         
         # --- DOSYA YÜKLEME ---
         layout.addWidget(QLabel("<b>Dosya Yükle:</b>"))
@@ -442,37 +640,71 @@ class AcousticCameraGUI(QMainWindow):
         self.loaded_file_label.setStyleSheet("font-size: 10px; color: gray;")
         layout.addWidget(self.loaded_file_label)
         
-        layout.addWidget(QLabel("─" * 30))
+        # Separator
+        separator = QFrame()
+        separator.setFrameShape(QFrame.HLine)
+        separator.setStyleSheet("background-color: #3d3d5c;")
+        layout.addWidget(separator)
         
         # --- KAYIT ---
         layout.addWidget(QLabel("<b>Kayıt:</b>"))
         
         # Kayıt butonu
         self.record_btn = QPushButton("🔴 KAYIT BAŞLAT")
-        self.record_btn.setMinimumHeight(40)
+        self.record_btn.setMinimumHeight(45)
+        self.record_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #c0392b;
+                color: white;
+                font-size: 14px;
+                font-weight: bold;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #e74c3c;
+            }
+        """)
         self.record_btn.clicked.connect(self.toggle_recording)
         layout.addWidget(self.record_btn)
         
         # Snapshot butonu
-        self.snapshot_btn = QPushButton("📸 Snapshot")
+        self.snapshot_btn = QPushButton("📸 Ekran Görüntüsü Al")
         self.snapshot_btn.clicked.connect(self.take_snapshot)
         layout.addWidget(self.snapshot_btn)
         
         # Kayıt seçenekleri
+        layout.addWidget(QLabel("Kayıt Seçenekleri:"))
         self.record_audio_check = QCheckBox("Ses kaydet (.wav)")
         self.record_audio_check.setChecked(True)
-        self.record_video_check = QCheckBox("Video kaydet (.mp4)")
+        self.record_video_check = QCheckBox("Video + Overlay kaydet (.mp4)")
         self.record_video_check.setChecked(True)
-        self.record_data_check = QCheckBox("Veri kaydet (.h5)")
+        self.record_viz_check = QCheckBox("Spektrogram + FFT dahil et")
+        self.record_viz_check.setChecked(True)
+        self.record_data_check = QCheckBox("Ham veri kaydet (.h5)")
         self.record_data_check.setChecked(False)
         
         layout.addWidget(self.record_audio_check)
         layout.addWidget(self.record_video_check)
+        layout.addWidget(self.record_viz_check)
         layout.addWidget(self.record_data_check)
         
-        # Kayıt süresi
-        self.record_time_label = QLabel("Kayıt Süresi: 00:00:00")
-        layout.addWidget(self.record_time_label)
+        # Kayıt süresi ve dosya bilgisi
+        record_info_frame = QFrame()
+        record_info_frame.setFrameShape(QFrame.StyledPanel)
+        record_info_frame.setStyleSheet("background-color: #2b2b3d; border-radius: 5px;")
+        record_info_layout = QVBoxLayout(record_info_frame)
+        record_info_layout.setSpacing(4)
+        record_info_layout.setContentsMargins(8, 8, 8, 8)
+        
+        self.record_time_label = QLabel("⏱ Kayıt Süresi: 00:00:00")
+        self.record_time_label.setStyleSheet("font-weight: bold; color: #e74c3c;")
+        self.record_file_label = QLabel("📁 Kayıt dosyası: -")
+        self.record_file_label.setWordWrap(True)
+        self.record_file_label.setStyleSheet("font-size: 10px; color: #888;")
+        
+        record_info_layout.addWidget(self.record_time_label)
+        record_info_layout.addWidget(self.record_file_label)
+        layout.addWidget(record_info_frame)
         
         group.setLayout(layout)
         return group
@@ -524,20 +756,20 @@ class AcousticCameraGUI(QMainWindow):
         panel = QWidget()
         layout = QVBoxLayout(panel)
         
-        # 3D Uzamsal Konum (en üstte)
-        spatial_group = QGroupBox("🎯 3D Uzamsal Konum")
+        # 3D Uzamsal Konum (en üstte) - pyqtgraph.opengl ile
+        spatial_group = QGroupBox("3D Uzamsal Konum")
         spatial_layout = QVBoxLayout()
-        self.spatial_3d_label = QLabel()
-        self.spatial_3d_label.setMinimumSize(280, 280)
-        self.spatial_3d_label.setStyleSheet("QLabel { background-color: black; border: 1px solid #555; }")
-        self.spatial_3d_label.setText("3D pozisyon\ngörseli")
-        self.spatial_3d_label.setAlignment(Qt.AlignCenter)
-        spatial_layout.addWidget(self.spatial_3d_label)
+        spatial_layout.setContentsMargins(2, 2, 2, 2)
+        
+        # Spatial3DWidget kullan
+        self.spatial_3d_widget = Spatial3DWidget()
+        self.spatial_3d_widget.setMinimumSize(280, 280)
+        spatial_layout.addWidget(self.spatial_3d_widget)
         spatial_group.setLayout(spatial_layout)
         layout.addWidget(spatial_group)
         
         # Tespit Edilen Ses Kaynakları - Dinamik Widget
-        sources_group = QGroupBox("🔊 Tespit Edilen Kaynaklar")
+        sources_group = QGroupBox("Tespit Edilen Kaynaklar")
         sources_layout = QVBoxLayout()
         
         # Dinamik kaynak container
@@ -547,7 +779,7 @@ class AcousticCameraGUI(QMainWindow):
         self.sources_container_layout.setContentsMargins(5, 5, 5, 5)
         
         # Başlangıçta "Kaynak algılanamadı" mesajı
-        self.no_source_label = QLabel("⚠️ Kaynak Algılanamadı")
+        self.no_source_label = QLabel("Kaynak Algılanamadı")
         self.no_source_label.setAlignment(Qt.AlignCenter)
         self.no_source_label.setStyleSheet("""
             QLabel {
@@ -575,7 +807,7 @@ class AcousticCameraGUI(QMainWindow):
     
     def _create_vu_meter_group(self) -> QGroupBox:
         """VU meter göstergeleri - 4x4 grid (UMA-16v2 fiziksel geometrisine uygun)"""
-        group = QGroupBox("📊 Mikrofon Array (16 Ch)")
+        group = QGroupBox("Mikrofon Array (16 Ch)")
         layout = QGridLayout()
         layout.setSpacing(8)
         layout.setContentsMargins(10, 10, 10, 10)
@@ -736,7 +968,7 @@ class AcousticCameraGUI(QMainWindow):
     
     def update_detected_sources(self, sources: list):
         """
-        Tespit edilen ses kaynaklarını güncelle
+        Tespit edilen ses kaynaklarını güncelle - Modern card layout
         
         Args:
             sources: [(x, y, z, db_level), ...] formatında kaynak listesi
@@ -754,107 +986,205 @@ class AcousticCameraGUI(QMainWindow):
             
             # Her kaynak için widget oluştur
             for idx, (x, y, z, db) in enumerate(sources, 1):
-                source_widget = self._create_source_widget(idx, x, y, z, db)
+                source_widget = self._create_source_card(idx, x, y, z, db)
                 self.sources_container_layout.addWidget(source_widget)
                 self.source_widgets.append(source_widget)
     
-    def _create_source_widget(self, idx: int, x: float, y: float, z: float, db: float) -> QWidget:
-        """Tek bir ses kaynağı için widget oluştur"""
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(4)
-        
-        # Renk belirleme (dB seviyesine göre)
-        if db > -20:
-            color = "#e74c3c"  # Kırmızı - Yüksek ses
-            icon = "🔴"
-            level_text = "Yüksek"
-        elif db > -35:
-            color = "#f39c12"  # Turuncu - Orta ses
-            icon = "🟠"
-            level_text = "Orta"
-        else:
-            color = "#2ecc71"  # Yeşil - Düşük ses
-            icon = "🟢"
-            level_text = "Düşük"
-        
-        # Calculate direction angle (azimuth from center)
+    def _create_source_card(self, idx: int, x: float, y: float, z: float, db: float) -> QWidget:
+        """Modern card-style source widget with LED bars and compass"""
         import math
-        azimuth_rad = math.atan2(x, z)  # Angle from center (Z axis)
-        azimuth_deg = math.degrees(azimuth_rad)
-        elevation_rad = math.atan2(y, math.sqrt(x*x + z*z))
-        elevation_deg = math.degrees(elevation_rad)
         
-        # Direction arrow based on azimuth
-        if azimuth_deg > 30:
-            direction_arrow = "➡️"
-            direction_text = "Sağ"
-        elif azimuth_deg < -30:
-            direction_arrow = "⬅️"
-            direction_text = "Sol"
-        elif elevation_deg > 20:
-            direction_arrow = "⬆️"
-            direction_text = "Yukarı"
-        elif elevation_deg < -20:
-            direction_arrow = "⬇️"
-            direction_text = "Aşağı"
+        widget = QWidget()
+        widget.setObjectName(f"source_card_{idx}")
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(6)
+        
+        # Color coding based on source index and level
+        source_colors = [
+            ("#00ff88", "#00cc66"),  # Green (primary)
+            ("#ff6b35", "#cc5529"),  # Orange
+            ("#00bfff", "#0099cc"),  # Cyan
+            ("#ff66ff", "#cc52cc"),  # Magenta
+            ("#ffff00", "#cccc00"),  # Yellow
+        ]
+        primary_color, secondary_color = source_colors[(idx - 1) % len(source_colors)]
+        
+        # Level indicator - Türkçe
+        if db > -20:
+            level_text = "Yüksek"
+            level_color = "#ff4444"  # Kırmızı
+        elif db > -35:
+            level_text = "Orta"
+            level_color = "#ffaa00"  # Turuncu
         else:
-            direction_arrow = "🎯"
-            direction_text = "Merkez"
+            level_text = "Düşük"
+            level_color = "#44cc44"  # Yeşil
         
-        # Başlık with source number and level
-        title_label = QLabel(f"{icon} Kaynak #{idx} - {level_text}")
-        title_label.setStyleSheet(f"color: {color}; font-weight: bold; font-size: 12px;")
-        layout.addWidget(title_label)
+        # === Header Row ===
+        header_layout = QHBoxLayout()
         
-        # Konum bilgisi (cm for readability)
-        pos_label = QLabel(f"📍 X: {x*100:.0f}cm  Y: {y*100:.0f}cm  Z: {z*100:.0f}cm")
-        pos_label.setStyleSheet("color: #aaa; font-size: 10px;")
-        layout.addWidget(pos_label)
+        # Source number with accent - Türkçe
+        source_num = QLabel(f"{idx}. Ses Kaynağı")
+        source_num.setStyleSheet(f"""
+            color: {primary_color}; 
+            font-weight: bold; 
+            font-size: 13px;
+            background-color: rgba(0, 255, 136, 0.1);
+            padding: 2px 8px;
+            border-radius: 3px;
+            border-left: 3px solid {primary_color};
+        """)
+        header_layout.addWidget(source_num)
         
-        # Direction info
-        direction_label = QLabel(f"{direction_arrow} Yön: {direction_text} ({azimuth_deg:.0f}°)")
-        direction_label.setStyleSheet("color: #8af; font-size: 10px;")
-        layout.addWidget(direction_label)
+        header_layout.addStretch()
         
-        # dB meter (progress bar)
-        db_layout = QHBoxLayout()
-        db_label = QLabel(f"{db:.1f} dB")
-        db_label.setStyleSheet(f"color: {color}; font-size: 11px; font-weight: bold; min-width: 55px;")
+        # Level indicator - Türkçe
+        level_label = QLabel(f"{level_text}")
+        level_label.setStyleSheet(f"""
+            color: {level_color}; 
+            font-size: 11px;
+            font-weight: bold;
+            padding: 2px 6px;
+            background-color: rgba(0, 0, 0, 0.3);
+            border-radius: 3px;
+        """)
+        header_layout.addWidget(level_label)
         
-        db_meter = QProgressBar()
-        db_meter.setMinimum(-60)
-        db_meter.setMaximum(0)
-        db_meter.setValue(int(max(-60, min(0, db))))
-        db_meter.setTextVisible(False)
-        db_meter.setMaximumHeight(12)
-        db_meter.setStyleSheet(f"""
+        layout.addLayout(header_layout)
+        
+        # === Separator Line ===
+        separator = QWidget()
+        separator.setFixedHeight(1)
+        separator.setStyleSheet(f"background-color: {secondary_color}; opacity: 0.5;")
+        layout.addWidget(separator)
+        
+        # === Power Reading with LED Bar ===
+        power_layout = QHBoxLayout()
+        power_layout.setSpacing(8)
+        
+        power_icon = QLabel("⚡")
+        power_icon.setStyleSheet("font-size: 12px;")
+        power_layout.addWidget(power_icon)
+        
+        power_value = QLabel(f"{db:+.1f} dB")
+        power_value.setStyleSheet(f"""
+            color: {primary_color}; 
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-weight: bold; 
+            font-size: 13px;
+            min-width: 70px;
+        """)
+        power_layout.addWidget(power_value)
+        
+        # LED Bar (custom styled progress)
+        led_bar = QProgressBar()
+        led_bar.setMinimum(-60)
+        led_bar.setMaximum(0)
+        led_bar.setValue(int(max(-60, min(0, db))))
+        led_bar.setTextVisible(False)
+        led_bar.setFixedHeight(8)
+        led_bar.setStyleSheet(f"""
             QProgressBar {{
-                border: 1px solid #555;
-                border-radius: 3px;
-                background-color: #1e1e1e;
+                border: none;
+                border-radius: 2px;
+                background-color: #1a1a2e;
             }}
             QProgressBar::chunk {{
-                background-color: {color};
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {secondary_color}, 
+                    stop:0.7 {primary_color},
+                    stop:1 white);
                 border-radius: 2px;
             }}
         """)
+        power_layout.addWidget(led_bar, stretch=1)
         
-        db_layout.addWidget(db_meter, stretch=3)
-        db_layout.addWidget(db_label)
-        layout.addLayout(db_layout)
+        layout.addLayout(power_layout)
         
-        # Widget stil
-        widget.setStyleSheet("""
-            QWidget {
-                background-color: #2b2b2b;
-                border: 1px solid #444;
-                border-radius: 5px;
-            }
+        # === Position with Compass ===
+        pos_layout = QHBoxLayout()
+        pos_layout.setSpacing(8)
+        
+        # Calculate direction
+        azimuth_rad = math.atan2(x, z if z != 0 else 0.001)
+        azimuth_deg = math.degrees(azimuth_rad)
+        elevation_rad = math.atan2(y, math.sqrt(x*x + z*z) if (x*x + z*z) > 0 else 0.001)
+        elevation_deg = math.degrees(elevation_rad)
+        
+        # Compass direction
+        if abs(azimuth_deg) < 15:
+            compass = "N"
+            compass_arrow = "↑"
+        elif azimuth_deg >= 15 and azimuth_deg < 75:
+            compass = "NE"
+            compass_arrow = "↗"
+        elif azimuth_deg >= 75:
+            compass = "E"
+            compass_arrow = "→"
+        elif azimuth_deg <= -15 and azimuth_deg > -75:
+            compass = "NW"
+            compass_arrow = "↖"
+        else:
+            compass = "W"
+            compass_arrow = "←"
+        
+        # Compass widget
+        compass_label = QLabel(f"{compass_arrow}")
+        compass_label.setStyleSheet(f"""
+            color: {primary_color};
+            font-size: 16px;
+            font-weight: bold;
+            background-color: rgba(0, 0, 0, 0.3);
+            border: 1px solid {secondary_color};
+            border-radius: 12px;
+            padding: 2px 6px;
+            min-width: 24px;
+        """)
+        compass_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pos_layout.addWidget(compass_label)
+        
+        # Position text
+        pos_text = QLabel(f"X:{x*100:+5.0f}  Y:{y*100:+5.0f}  Z:{z*100:5.0f}")
+        pos_text.setStyleSheet("""
+            color: #aabbcc; 
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 10px;
+        """)
+        pos_layout.addWidget(pos_text)
+        
+        pos_layout.addStretch()
+        
+        # Angle display
+        angle_text = QLabel(f"∠{azimuth_deg:+4.0f}°")
+        angle_text.setStyleSheet(f"""
+            color: {primary_color}; 
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 10px;
+        """)
+        pos_layout.addWidget(angle_text)
+        
+        layout.addLayout(pos_layout)
+        
+        # === Card Styling ===
+        widget.setStyleSheet(f"""
+            QWidget#source_card_{idx} {{
+                background-color: #16162a;
+                border: 1px solid {secondary_color};
+                border-radius: 8px;
+                border-left: 4px solid {primary_color};
+            }}
+            QWidget#source_card_{idx}:hover {{
+                background-color: #1e1e3a;
+                border-color: {primary_color};
+            }}
         """)
         
         return widget
+    
+    def _create_source_widget(self, idx: int, x: float, y: float, z: float, db: float) -> QWidget:
+        """Legacy wrapper - redirects to new card style"""
+        return self._create_source_card(idx, x, y, z, db)
     
     def _update_sources_panel(self):
         """
@@ -885,94 +1215,38 @@ class AcousticCameraGUI(QMainWindow):
     def _update_3d_visualization(self):
         """
         Update 3D spatial visualization with detected sources
-        Renders a 3D scatter plot showing microphone array and detected sources
+        Uses pyqtgraph.opengl Spatial3DWidget for real-time rendering
         """
         try:
-            # Create figure with dark background
-            fig = plt.figure(figsize=(3, 3), facecolor='#1e1e1e')
-            ax = fig.add_subplot(111, projection='3d', facecolor='#1e1e1e')
+            # Check if widget exists
+            if not hasattr(self, 'spatial_3d_widget') or self.spatial_3d_widget is None:
+                return
             
-            # Get mic positions if available
+            # Update microphone positions if available
             if hasattr(self, 'mic_positions') and self.mic_positions is not None:
-                mic_x = self.mic_positions[:, 0] * 100  # Convert to cm
-                mic_y = self.mic_positions[:, 1] * 100
-                mic_z = self.mic_positions[:, 2] * 100
-                ax.scatter(mic_x, mic_y, mic_z, c='#3498db', s=30, alpha=0.7, 
-                          marker='o', label='Mikrofon')
+                self.spatial_3d_widget.set_microphone_positions(self.mic_positions)
             
-            # Plot detected sources
+            # Prepare source data for 3D widget
+            sources = []
             if hasattr(self, 'detected_peaks') and len(self.detected_peaks) > 0:
-                colors = ['#e74c3c', '#f39c12', '#2ecc71', '#9b59b6', '#1abc9c']
-                for i, peak in enumerate(self.detected_peaks):
-                    src_x = peak.get('x', 0) * 100  # Convert to cm
-                    src_y = peak.get('y', 0) * 100
-                    src_z = self.focus_distance_spin.value() * 100  # Focus distance as Z
-                    color = colors[i % len(colors)]
-                    size = 200 if i == 0 else 120  # Primary source is larger
-                    ax.scatter([src_x], [src_y], [src_z], c=color, s=size, 
-                              alpha=0.9, marker='*', edgecolors='white', linewidths=1)
-                    # Add label
-                    ax.text(src_x, src_y, src_z + 5, f'S{i+1}', color='white', 
-                           fontsize=8, ha='center')
+                focus_z = self.focus_distance_spin.value() if hasattr(self, 'focus_distance_spin') else 1.0
+                
+                for peak in self.detected_peaks:
+                    source_data = {
+                        'x': peak.get('x', 0),
+                        'y': peak.get('y', 0),
+                        'z': focus_z,  # Z = focus distance
+                        'power_db': peak.get('power_db', 0),
+                        'color': peak.get('color', (0, 255, 0)),
+                        'index': peak.get('index', 1)
+                    }
+                    sources.append(source_data)
             
-            # Style the axes
-            ax.set_xlabel('X (cm)', color='white', fontsize=8)
-            ax.set_ylabel('Y (cm)', color='white', fontsize=8)
-            ax.set_zlabel('Z (cm)', color='white', fontsize=8)
-            
-            # Set reasonable axis limits based on grid size
-            grid_half = 30  # 30cm = 0.3m half-size
-            focus_z = self.focus_distance_spin.value() * 100 if hasattr(self, 'focus_distance_spin') else 100
-            ax.set_xlim([-grid_half, grid_half])
-            ax.set_ylim([-grid_half, grid_half])
-            ax.set_zlim([0, focus_z + 20])
-            
-            # Customize tick labels
-            ax.tick_params(axis='x', colors='white', labelsize=6)
-            ax.tick_params(axis='y', colors='white', labelsize=6)
-            ax.tick_params(axis='z', colors='white', labelsize=6)
-            
-            # Set viewing angle
-            ax.view_init(elev=25, azim=45)
-            
-            # Make panes transparent
-            ax.xaxis.pane.fill = False
-            ax.yaxis.pane.fill = False
-            ax.zaxis.pane.fill = False
-            ax.xaxis.pane.set_edgecolor('#444')
-            ax.yaxis.pane.set_edgecolor('#444')
-            ax.zaxis.pane.set_edgecolor('#444')
-            
-            # Grid styling
-            ax.xaxis._axinfo["grid"]["color"] = "#444"
-            ax.yaxis._axinfo["grid"]["color"] = "#444"
-            ax.zaxis._axinfo["grid"]["color"] = "#444"
-            
-            plt.tight_layout(pad=0.5)
-            
-            # Render to image buffer
-            buf = BytesIO()
-            fig.savefig(buf, format='png', dpi=100, facecolor='#1e1e1e', 
-                       edgecolor='none', bbox_inches='tight', pad_inches=0.1)
-            buf.seek(0)
-            plt.close(fig)
-            
-            # Convert to QPixmap and display
-            img_data = buf.getvalue()
-            qimg = QImage.fromData(img_data)
-            pixmap = QPixmap.fromImage(qimg)
-            
-            # Scale to fit label
-            scaled_pixmap = pixmap.scaled(
-                self.spatial_3d_label.size(),
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation
-            )
-            self.spatial_3d_label.setPixmap(scaled_pixmap)
+            # Update 3D widget with sources
+            self.spatial_3d_widget.update_sources(sources)
             
         except Exception as e:
             logger.error(f"3D visualization error: {e}")
-            self.spatial_3d_label.setText(f"3D Hata:\n{str(e)[:50]}")
     
     # Slot fonksiyonları
     def toggle_start_stop(self):
@@ -988,17 +1262,12 @@ class AcousticCameraGUI(QMainWindow):
         self.is_running = True
         
         # Seçili video cihazını al
-        selected_video = self.video_device_combo.currentText()
-        if "Webcam 0" in selected_video:
-            video_device_id = 0
-        elif "Webcam 1" in selected_video:
-            video_device_id = 1
-        elif "Webcam 2" in selected_video:
-            video_device_id = 2
-        else:
+        video_device_id = self.video_device_combo.currentData()
+        if video_device_id is None or video_device_id < 0:
             video_device_id = 0  # Default
         
-        logger.info(f"Video cihaz açılıyor: {selected_video} (ID: {video_device_id})")
+        video_device_text = self.video_device_combo.currentText()
+        logger.info(f"Video cihaz açılıyor: {video_device_text} (ID: {video_device_id})")
         
         # Webcam'i aç
         self.video_capture = cv2.VideoCapture(video_device_id)
@@ -1007,15 +1276,17 @@ class AcousticCameraGUI(QMainWindow):
             logger.error(f"Webcam açılamadı! (ID: {video_device_id})")
             QMessageBox.warning(self, "Webcam Hatası", 
                                f"Video cihazı açılamadı! (ID: {video_device_id})\nLütfen kamera bağlantısını kontrol edin.")
-            self.video_status_label.setText("🔴 Video: Hata")
+            self.video_status_label.setText("🔴 Kamera: Hata")
             self.video_capture = None
         else:
             # Kamera bilgilerini al
             width = int(self.video_capture.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(self.video_capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
             fps = int(self.video_capture.get(cv2.CAP_PROP_FPS))
+            backend = self.video_capture.getBackendName()
             
-            self.video_status_label.setText(f"🟢 Video: Bağlı ({width}x{height}@{fps}fps)")
+            self.connected_video_device_name = f"{video_device_text}"
+            self.video_status_label.setText(f"🟢 Kamera: {width}x{height}@{fps}fps")
             logger.info(f"Webcam başarıyla açıldı: {width}x{height}@{fps}fps")
         
         # Audio stream'i başlat
@@ -1046,6 +1317,10 @@ class AcousticCameraGUI(QMainWindow):
         logger.info("Sistem durduruluyor...")
         self.is_running = False
         
+        # Kayıt devam ediyorsa durdur
+        if self.is_recording:
+            self.stop_recording()
+        
         # Timer durdur
         self.update_timer.stop()
         
@@ -1070,8 +1345,10 @@ class AcousticCameraGUI(QMainWindow):
             }
         """)
         
-        self.audio_status_label.setText("🔴 Audio: Bağlı değil")
-        self.video_status_label.setText("🔴 Video: Bağlı değil")
+        self.audio_status_label.setText("🔴 Mikrofon: Bağlı değil")
+        self.video_status_label.setText("🔴 Kamera: Bağlı değil")
+        self.connected_audio_device_name = ""
+        self.connected_video_device_name = ""
         
         self.statusbar.showMessage("Sistem durduruldu")
         self._set_placeholder_image()
@@ -1080,27 +1357,33 @@ class AcousticCameraGUI(QMainWindow):
         """Audio stream thread'ini başlat"""
         try:
             # Seçili audio cihazını al
-            selected_audio = self.audio_device_combo.currentText()
+            device_index = self.audio_device_combo.currentData()
+            device_name = self.audio_device_combo.currentText()
             
-            # UMA-16'yı bul
-            from audio.device_test import find_uma16_device
-            device_index = find_uma16_device()
+            if device_index is None or device_index < 0:
+                # UMA-16'yı bul
+                from audio.device_test import find_uma16_device
+                device_index = find_uma16_device()
+                
+                if device_index is None:
+                    logger.error("UMA-16 cihazı bulunamadı!")
+                    QMessageBox.warning(self, "Audio Hatası", 
+                                       "UMA-16 cihazı bulunamadı!\nLütfen cihaz bağlantısını kontrol edin.")
+                    self.audio_status_label.setText("🔴 Mikrofon: Cihaz bulunamadı")
+                    return
             
-            if device_index is None:
-                logger.error("UMA-16 cihazı bulunamadı!")
-                QMessageBox.warning(self, "Audio Hatası", 
-                                   "UMA-16 cihazı bulunamadı!\nLütfen cihaz bağlantısını kontrol edin.")
-                self.audio_status_label.setText("🔴 Audio: Cihaz bulunamadı")
-                return
+            logger.info(f"Audio cihaz açılıyor: {device_name} (ID: {device_index})")
             
-            logger.info(f"UMA-16 bulundu: Device #{device_index}")
+            # Cihaz bilgilerini al
+            device_info = sd.query_devices(device_index)
+            num_channels = min(16, device_info['max_input_channels'])
             
             # Audio thread oluştur
             self.audio_thread = AudioStreamThread(
                 device_index=device_index,
                 sample_rate=48000,
                 buffer_size=4096,
-                num_channels=16,
+                num_channels=num_channels,
                 buffer_duration=5.0,
                 gain=10.0  # Digital gain (10x güçlendirme)
             )
@@ -1113,14 +1396,18 @@ class AcousticCameraGUI(QMainWindow):
             # Thread'i başlat
             self.audio_thread.start()
             
-            self.audio_status_label.setText("🟢 Audio: UMA-16 (16ch @ 48kHz)")
-            logger.info("Audio stream başlatıldı")
+            # Bağlı cihaz ismini kaydet - kısa isim oluştur
+            self.connected_audio_device_name = device_info['name']
+            # İsmi kısalt (ilk 20 karakter)
+            short_name = self.connected_audio_device_name[:25] + "..." if len(self.connected_audio_device_name) > 25 else self.connected_audio_device_name
+            self.audio_status_label.setText(f"🟢 Mikrofon: {num_channels}ch @ 48kHz")
+            logger.info(f"Audio stream başlatıldı: {self.connected_audio_device_name}")
             
         except Exception as e:
             error_msg = f"Audio stream başlatılamadı: {str(e)}"
             logger.error(error_msg)
             QMessageBox.warning(self, "Audio Hatası", error_msg)
-            self.audio_status_label.setText("🔴 Audio: Hata")
+            self.audio_status_label.setText("🔴 Mikrofon: Hata")
     
     def _stop_audio_stream(self):
         """Audio stream thread'ini durdur"""
@@ -1156,7 +1443,7 @@ class AcousticCameraGUI(QMainWindow):
     def _on_audio_error(self, error_msg: str):
         """Audio stream hata mesajı"""
         logger.error(f"Audio error: {error_msg}")
-        self.audio_status_label.setText("🔴 Audio: Hata")
+        self.audio_status_label.setText("🔴 Mikrofon: Hata")
     
     def _update_visualizations(self, audio_data: np.ndarray, sample_rate: int):
         """
@@ -1167,6 +1454,10 @@ class AcousticCameraGUI(QMainWindow):
             sample_rate: Örnekleme hızı
         """
         try:
+            # Kayıt için audio buffer'a ekle
+            if self.is_recording and self.record_audio_check.isChecked():
+                self.audio_record_buffer.append(audio_data.copy())
+            
             # Throttle - her N callback'te bir güncelle (performans)
             self.viz_update_counter += 1
             if self.viz_update_counter < self.viz_update_interval:
@@ -1212,26 +1503,235 @@ class AcousticCameraGUI(QMainWindow):
             self.stop_recording()
     
     def start_recording(self):
-        """Kaydı başlat"""
-        logger.info("Kayıt başlatıldı")
+        """Kaydı başlat - Video + Ses + Görselleştirmeler"""
+        if not self.is_running:
+            QMessageBox.warning(self, "Kayıt Hatası", 
+                               "Önce sistemi başlatmanız gerekiyor!")
+            return
+        
+        logger.info("Kayıt başlatılıyor...")
+        
+        # Kayıt dizini oluştur
+        records_dir = Path(__file__).parent.parent.parent / 'data' / 'recordings'
+        records_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Zaman damgası ile dosya adı
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.record_base_name = f"recording_{timestamp}"
+        self.record_dir = records_dir / self.record_base_name
+        self.record_dir.mkdir(exist_ok=True)
+        
+        # Video writer başlat (overlay dahil)
+        if self.record_video_check.isChecked() and self.video_capture is not None:
+            width = int(self.video_capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(self.video_capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            
+            # Eğer görselleştirmeler dahil edilecekse, daha geniş bir frame oluştur
+            if self.record_viz_check.isChecked():
+                # Video + Spektrogram + FFT yan yana
+                total_width = width
+                total_height = height + 200  # Alt kısma görselleştirmeler
+            else:
+                total_width = width
+                total_height = height
+            
+            video_path = str(self.record_dir / f"{self.record_base_name}.mp4")
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            self.video_writer = cv2.VideoWriter(video_path, fourcc, 30.0, (total_width, total_height))
+            logger.info(f"Video kayıt başladı: {video_path}")
+        
+        # Audio buffer'ı temizle
+        self.audio_record_buffer = []
+        
+        # Kayıt başlangıç zamanı
+        self.record_start_time = time.time()
         self.is_recording = True
+        
+        # Timer başlat
+        self.record_timer.start(1000)  # Her saniye güncelle
+        
+        # UI güncelle
         self.record_btn.setText("⏹️ KAYIT DURDUR")
-        self.record_btn.setStyleSheet("background-color: #f44336; color: white;")
-        self.statusbar.showMessage("Kayıt yapılıyor...")
+        self.record_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #27ae60;
+                color: white;
+                font-size: 14px;
+                font-weight: bold;
+                border-radius: 5px;
+                border: 2px solid #e74c3c;
+            }
+            QPushButton:hover {
+                background-color: #2ecc71;
+            }
+        """)
+        self.record_file_label.setText(f"📁 Kayıt: {self.record_base_name}")
+        self.statusbar.showMessage("🔴 Kayıt yapılıyor...")
     
     def stop_recording(self):
-        """Kaydı durdur"""
-        logger.info("Kayıt durduruldu")
+        """Kaydı durdur ve dosyaları kaydet"""
+        if not self.is_recording:
+            return
+        
+        logger.info("Kayıt durduruluyor...")
         self.is_recording = False
+        self.record_timer.stop()
+        
+        # Video writer'ı kapat
+        if self.video_writer is not None:
+            self.video_writer.release()
+            self.video_writer = None
+            logger.info("Video kayıt tamamlandı")
+        
+        # Audio kaydet
+        if self.record_audio_check.isChecked() and len(self.audio_record_buffer) > 0:
+            try:
+                import soundfile as sf
+                audio_data = np.concatenate(self.audio_record_buffer, axis=0)
+                audio_path = str(self.record_dir / f"{self.record_base_name}.wav")
+                sf.write(audio_path, audio_data, 48000)
+                logger.info(f"Audio kayıt tamamlandı: {audio_path}")
+            except Exception as e:
+                logger.error(f"Audio kayıt hatası: {e}")
+        
+        self.audio_record_buffer = []
+        
+        # UI güncelle
         self.record_btn.setText("🔴 KAYIT BAŞLAT")
-        self.record_btn.setStyleSheet("")
-        self.statusbar.showMessage("Kayıt durduruldu")
+        self.record_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #c0392b;
+                color: white;
+                font-size: 14px;
+                font-weight: bold;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #e74c3c;
+            }
+        """)
+        
+        # Kayıt süresini hesapla
+        if self.record_start_time is not None:
+            duration = time.time() - self.record_start_time
+            mins = int(duration // 60)
+            secs = int(duration % 60)
+            self.record_file_label.setText(f"📁 Kaydedildi: {self.record_base_name} ({mins}:{secs:02d})")
+        
+        self.statusbar.showMessage("Kayıt tamamlandı")
+        QMessageBox.information(self, "Kayıt Tamamlandı", 
+                               f"Kayıt başarıyla tamamlandı!\n\nDosya: {self.record_dir}")
+    
+    def _update_record_time(self):
+        """Kayıt süresini güncelle"""
+        if self.record_start_time is not None:
+            elapsed = time.time() - self.record_start_time
+            hours = int(elapsed // 3600)
+            mins = int((elapsed % 3600) // 60)
+            secs = int(elapsed % 60)
+            self.record_time_label.setText(f"⏱ Kayıt Süresi: {hours:02d}:{mins:02d}:{secs:02d}")
+    
+    def _record_frame(self, frame: np.ndarray):
+        """Kayıt için frame ekle"""
+        if not self.is_recording or self.video_writer is None:
+            return
+        
+        try:
+            # Görselleştirmeler dahil edilecekse
+            if self.record_viz_check.isChecked():
+                # Ana frame'in altına görselleştirme alanı ekle
+                h, w = frame.shape[:2]
+                viz_height = 200
+                
+                # Yeni büyük frame oluştur
+                combined_frame = np.zeros((h + viz_height, w, 3), dtype=np.uint8)
+                combined_frame[:h, :, :] = frame
+                
+                # Spektrogram ve FFT'yi yakala (widget'lardan)
+                # Bu basitleştirilmiş versiyon - asıl görüntüyü almak için grab kullanılabilir
+                # Şimdilik sadece placeholder
+                combined_frame[h:, :, :] = 30  # Koyu gri arkaplan
+                
+                # "Spektrogram + FFT" yazısı ekle
+                cv2.putText(combined_frame, "Spektrogram + FFT (Kayit)", (10, h + 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
+                
+                self.video_writer.write(combined_frame)
+            else:
+                self.video_writer.write(frame)
+                
+        except Exception as e:
+            logger.error(f"Frame kayıt hatası: {e}")
     
     def take_snapshot(self):
-        """Anlık görüntü al"""
-        logger.info("Snapshot alındı")
-        QMessageBox.information(self, "Snapshot", 
-                               "Anlık görüntü kaydedildi!")
+        """Anlık görüntü al - ekranda görünen her şeyi kaydet"""
+        logger.info("Snapshot alınıyor...")
+        
+        try:
+            # Kayıt dizini
+            snapshots_dir = Path(__file__).parent.parent.parent / 'data' / 'snapshots'
+            snapshots_dir.mkdir(parents=True, exist_ok=True)
+            
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            
+            # Video frame'i al (overlay dahil)
+            if self.video_capture is not None and self.video_capture.isOpened():
+                ret, frame = self.video_capture.read()
+                if ret:
+                    # Eğer overlay aktifse ve heatmap varsa, overlay uygula
+                    if (self.beamforming_enabled and 
+                        self.enable_overlay_check.isChecked() and 
+                        self.latest_heatmap is not None):
+                        frame = self._apply_overlay_to_frame(frame)
+                    
+                    # Kaydet
+                    snapshot_path = snapshots_dir / f"snapshot_{timestamp}.png"
+                    cv2.imwrite(str(snapshot_path), frame)
+                    logger.info(f"Snapshot kaydedildi: {snapshot_path}")
+                    
+                    QMessageBox.information(self, "Snapshot", 
+                                           f"Görüntü kaydedildi!\n\n{snapshot_path}")
+                else:
+                    QMessageBox.warning(self, "Hata", "Frame alınamadı!")
+            else:
+                QMessageBox.warning(self, "Hata", "Kamera bağlı değil!")
+                
+        except Exception as e:
+            logger.error(f"Snapshot hatası: {e}")
+            QMessageBox.warning(self, "Hata", f"Snapshot alınamadı: {e}")
+    
+    def _apply_overlay_to_frame(self, frame: np.ndarray) -> np.ndarray:
+        """Frame'e overlay uygula (snapshot ve kayıt için)"""
+        if self.latest_heatmap is None:
+            return frame
+        
+        try:
+            video_h, video_w = frame.shape[:2]
+            
+            # Heatmap'i video boyutuna ölçekle
+            heatmap_resized = cv2.resize(
+                self.latest_heatmap,
+                (video_w, video_h),
+                interpolation=cv2.INTER_LINEAR
+            )
+            
+            # RGB ve alpha ayır
+            heatmap_rgb = heatmap_resized[:, :, :3]
+            heatmap_alpha = heatmap_resized[:, :, 3] / 255.0
+            
+            # Kullanıcı şeffaflığı
+            user_alpha = self.alpha_slider.value() / 100.0
+            combined_alpha = heatmap_alpha * user_alpha
+            
+            # Alpha blending
+            alpha_3ch = combined_alpha[:, :, np.newaxis]
+            blended = (frame * (1 - alpha_3ch) + heatmap_rgb * alpha_3ch).astype(np.uint8)
+            
+            return blended
+            
+        except Exception as e:
+            logger.error(f"Overlay uygulama hatası: {e}")
+            return frame
     
     def on_freq_range_changed(self, min_val, max_val):
         """Frekans aralığı değiştiğinde"""
@@ -1742,8 +2242,139 @@ class AcousticCameraGUI(QMainWindow):
         
         return heatmap_rgba
     
+    def _draw_corner_brackets(self, frame, cx, cy, size, color, thickness=2, gap=8):
+        """Draw corner brackets (HUD-style target acquisition)"""
+        # Corner length
+        corner_len = size // 3
+        
+        # Top-left corner
+        cv2.line(frame, (cx - size, cy - size), (cx - size + corner_len, cy - size), color, thickness, cv2.LINE_AA)
+        cv2.line(frame, (cx - size, cy - size), (cx - size, cy - size + corner_len), color, thickness, cv2.LINE_AA)
+        
+        # Top-right corner
+        cv2.line(frame, (cx + size, cy - size), (cx + size - corner_len, cy - size), color, thickness, cv2.LINE_AA)
+        cv2.line(frame, (cx + size, cy - size), (cx + size, cy - size + corner_len), color, thickness, cv2.LINE_AA)
+        
+        # Bottom-left corner
+        cv2.line(frame, (cx - size, cy + size), (cx - size + corner_len, cy + size), color, thickness, cv2.LINE_AA)
+        cv2.line(frame, (cx - size, cy + size), (cx - size, cy + size - corner_len), color, thickness, cv2.LINE_AA)
+        
+        # Bottom-right corner
+        cv2.line(frame, (cx + size, cy + size), (cx + size - corner_len, cy + size), color, thickness, cv2.LINE_AA)
+        cv2.line(frame, (cx + size, cy + size), (cx + size, cy + size - corner_len), color, thickness, cv2.LINE_AA)
+        
+        # Center crosshair lines (short lines with gap in middle)
+        # Horizontal
+        cv2.line(frame, (cx - size + corner_len + 5, cy), (cx - gap, cy), color, 1, cv2.LINE_AA)
+        cv2.line(frame, (cx + gap, cy), (cx + size - corner_len - 5, cy), color, 1, cv2.LINE_AA)
+        # Vertical
+        cv2.line(frame, (cx, cy - size + corner_len + 5), (cx, cy - gap), color, 1, cv2.LINE_AA)
+        cv2.line(frame, (cx, cy + gap), (cx, cy + size - corner_len - 5), color, 1, cv2.LINE_AA)
+    
+    def _draw_diamond_marker(self, frame, cx, cy, size, color, thickness=1):
+        """Draw diamond marker for secondary targets"""
+        pts = np.array([
+            [cx, cy - size],  # Top
+            [cx + size, cy],  # Right
+            [cx, cy + size],  # Bottom
+            [cx - size, cy],  # Left
+        ], dtype=np.int32)
+        cv2.polylines(frame, [pts], True, color, thickness, cv2.LINE_AA)
+    
+    def _draw_callout_box(self, frame, cx, cy, texts, color, direction='right'):
+        """Draw callout line with text box (HUD style)"""
+        # Text measurement
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.5
+        thickness_text = 1
+        
+        # Calculate text sizes
+        max_width = 0
+        total_height = 0
+        line_heights = []
+        for text in texts:
+            (w, h), _ = cv2.getTextSize(text, font, font_scale, thickness_text)
+            max_width = max(max_width, w)
+            line_heights.append(h + 5)
+            total_height += h + 8
+        
+        # Padding
+        padding = 8
+        box_width = max_width + padding * 2
+        box_height = total_height + padding
+        
+        # Position calculation
+        line_length = 40
+        if direction == 'right':
+            line_end_x = cx + line_length + 20
+            line_end_y = cy - 20
+            box_x = line_end_x
+            box_y = line_end_y - box_height // 2
+        else:  # left
+            line_end_x = cx - line_length - 20
+            line_end_y = cy - 20
+            box_x = line_end_x - box_width
+            box_y = line_end_y - box_height // 2
+        
+        # Create overlay for semi-transparent box
+        overlay = frame.copy()
+        
+        # Draw callout line (angled)
+        cv2.line(frame, (cx, cy), (cx + (15 if direction == 'right' else -15), cy - 15), color, 1, cv2.LINE_AA)
+        cv2.line(frame, (cx + (15 if direction == 'right' else -15), cy - 15), (line_end_x, line_end_y), color, 1, cv2.LINE_AA)
+        
+        # Draw semi-transparent background box
+        cv2.rectangle(overlay, (box_x, box_y), (box_x + box_width, box_y + box_height), (20, 20, 30), -1)
+        cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+        
+        # Draw box border
+        cv2.rectangle(frame, (box_x, box_y), (box_x + box_width, box_y + box_height), color, 1, cv2.LINE_AA)
+        
+        # Draw accent line on left/right edge
+        if direction == 'right':
+            cv2.line(frame, (box_x, box_y), (box_x, box_y + box_height), color, 2, cv2.LINE_AA)
+        else:
+            cv2.line(frame, (box_x + box_width, box_y), (box_x + box_width, box_y + box_height), color, 2, cv2.LINE_AA)
+        
+        # Draw text
+        text_x = box_x + padding
+        text_y = box_y + padding + line_heights[0]
+        for i, text in enumerate(texts):
+            cv2.putText(frame, text, (text_x, text_y), font, font_scale, color, thickness_text, cv2.LINE_AA)
+            if i < len(texts) - 1:
+                text_y += line_heights[i + 1] + 3
+    
+    def _draw_hud_frame_elements(self, frame, video_w, video_h):
+        """Draw HUD frame corner elements and status indicators"""
+        color = (0, 200, 180)  # Cyan-ish
+        
+        # Frame corner decorations
+        corner_size = 60
+        
+        # Top-left
+        cv2.line(frame, (10, 10), (10 + corner_size, 10), color, 2, cv2.LINE_AA)
+        cv2.line(frame, (10, 10), (10, 10 + corner_size), color, 2, cv2.LINE_AA)
+        
+        # Top-right
+        cv2.line(frame, (video_w - 10, 10), (video_w - 10 - corner_size, 10), color, 2, cv2.LINE_AA)
+        cv2.line(frame, (video_w - 10, 10), (video_w - 10, 10 + corner_size), color, 2, cv2.LINE_AA)
+        
+        # Bottom-left
+        cv2.line(frame, (10, video_h - 10), (10 + corner_size, video_h - 10), color, 2, cv2.LINE_AA)
+        cv2.line(frame, (10, video_h - 10), (10, video_h - 10 - corner_size), color, 2, cv2.LINE_AA)
+        
+        # Bottom-right
+        cv2.line(frame, (video_w - 10, video_h - 10), (video_w - 10 - corner_size, video_h - 10), color, 2, cv2.LINE_AA)
+        cv2.line(frame, (video_w - 10, video_h - 10), (video_w - 10, video_h - 10 - corner_size), color, 2, cv2.LINE_AA)
+        
+        # Draw scanning lines (subtle horizontal lines)
+        for i in range(3):
+            y_pos = int(video_h * (0.25 + i * 0.25))
+            cv2.line(frame, (15, y_pos), (35, y_pos), color, 1, cv2.LINE_AA)
+            cv2.line(frame, (video_w - 35, y_pos), (video_w - 15, y_pos), color, 1, cv2.LINE_AA)
+    
     def _update_video_overlay(self):
-        """Update video frame with acoustic heatmap overlay - FULL SCREEN mapping"""
+        """Update video frame with acoustic heatmap overlay - HUD Style"""
         try:
             # Check if we have video and heatmap
             if self.video_capture is None or self.latest_heatmap is None:
@@ -1755,12 +2386,21 @@ class AcousticCameraGUI(QMainWindow):
                 return
             
             video_h, video_w = frame.shape[:2]
+            
+            # Overlay aktif mi kontrol et
+            if not self.enable_overlay_check.isChecked():
+                # Overlay kapalı - sadece plain video göster
+                # Kayıt varsa frame'i kaydet
+                if self.is_recording:
+                    self._record_frame(frame)
+                self._display_image(frame)
+                return
+            
             heatmap_h, heatmap_w = self.latest_heatmap.shape[:2]
             
             # ============================================================
             # STRATEGY: FULL SCREEN OVERLAY (stretch to entire video)
             # ============================================================
-            # Stretch heatmap to cover the entire video frame
             overlay_w = video_w
             overlay_h = video_h
             x_offset = 0
@@ -1802,76 +2442,91 @@ class AcousticCameraGUI(QMainWindow):
             frame[y_offset:y_offset+overlay_h, x_offset:x_offset+overlay_w] = blended
             
             # ============================================================
-            # Draw crosshairs at all detected peak positions
+            # Draw HUD frame elements
             # ============================================================
-            for peak in self.detected_peaks:
-                peak_x_m = peak['x']  # meters
-                peak_y_m = peak['y']  # meters
-                color = peak.get('color', (0, 255, 0))  # BGR color
-                peak_index = peak.get('index', 1)
-                
-                # Convert from physical coordinates (meters) to pixel coordinates
-                # Grid coordinates: -grid_size/2 to +grid_size/2 in meters
-                # Pixel coordinates: 0 to overlay_w (or overlay_h)
-                
-                # Normalize to [0, 1]
-                norm_x = (peak_x_m + grid_size_x / 2.0) / grid_size_x  # 0 to 1
-                norm_y = (peak_y_m + grid_size_y / 2.0) / grid_size_y  # 0 to 1
-                
-                # Map to overlay pixel coordinates
-                # Note: Y axis is flipped in image coordinates (top=0, bottom=height)
-                peak_pixel_x = int(norm_x * overlay_w)
-                peak_pixel_y = int((1.0 - norm_y) * overlay_h)  # Flip Y
-                
-                # Convert to absolute video coordinates
-                peak_video_x = x_offset + peak_pixel_x
-                peak_video_y = y_offset + peak_pixel_y
-                
-                # Clamp to video bounds
-                peak_video_x = np.clip(peak_video_x, 10, video_w - 10)
-                peak_video_y = np.clip(peak_video_y, 10, video_h - 10)
-                
-                # Draw crosshair
-                thickness = 3 if peak_index == 1 else 2  # Primary peak is thicker
-                size = 30 if peak_index == 1 else 20  # Primary peak is larger
-                
-                # Horizontal line
-                cv2.line(frame, (peak_video_x - size, peak_video_y), 
-                        (peak_video_x + size, peak_video_y), color, thickness)
-                # Vertical line
-                cv2.line(frame, (peak_video_x, peak_video_y - size), 
-                        (peak_video_x, peak_video_y + size), color, thickness)
-                
-                # Draw filled circle at center
-                circle_radius = 8 if peak_index == 1 else 5
-                cv2.circle(frame, (peak_video_x, peak_video_y), circle_radius, color, -1)
-                
-                # Draw source number
-                cv2.putText(frame, str(peak_index), 
-                           (peak_video_x - 5, peak_video_y - size - 5),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
-                cv2.putText(frame, str(peak_index), 
-                           (peak_video_x - 5, peak_video_y - size - 5),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
-                
-                # Draw text with power level (only for primary peak to avoid clutter)
-                if peak_index == 1:
-                    power_text = f"{peak['power_db']:.1f} dB"
-                    position_text = f"({peak_x_m*100:.1f}, {peak_y_m*100:.1f}) cm"
+            self._draw_hud_frame_elements(frame, video_w, video_h)
+            
+            # ============================================================
+            # Draw HUD-style markers at detected peak positions
+            # ============================================================
+            if self.show_peaks_check.isChecked():
+                for peak in self.detected_peaks:
+                    peak_x_m = peak['x']  # meters
+                    peak_y_m = peak['y']  # meters
+                    color = peak.get('color', (0, 255, 0))  # BGR color
+                    peak_index = peak.get('index', 1)
                     
-                    # Text background (for readability)
-                    text_x = peak_video_x + 35
-                    text_y = peak_video_y - 10
+                    # Convert from physical coordinates (meters) to pixel coordinates
+                    norm_x = (peak_x_m + grid_size_x / 2.0) / grid_size_x  # 0 to 1
+                    norm_y = (peak_y_m + grid_size_y / 2.0) / grid_size_y  # 0 to 1
                     
-                    cv2.putText(frame, power_text, (text_x, text_y), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4, cv2.LINE_AA)
-                    cv2.putText(frame, power_text, (text_x, text_y), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+                    # Map to overlay pixel coordinates (Y axis flipped)
+                    peak_pixel_x = int(norm_x * overlay_w)
+                    peak_pixel_y = int((1.0 - norm_y) * overlay_h)
                     
-                    cv2.putText(frame, position_text, (text_x, text_y + 25), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 4, cv2.LINE_AA)
-                    cv2.putText(frame, position_text, (text_x, text_y + 25), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
+                    # Convert to absolute video coordinates
+                    peak_video_x = x_offset + peak_pixel_x
+                    peak_video_y = y_offset + peak_pixel_y
+                    
+                    # Clamp to video bounds
+                    peak_video_x = int(np.clip(peak_video_x, 50, video_w - 50))
+                    peak_video_y = int(np.clip(peak_video_y, 50, video_h - 50))
+                    
+                    # ============================================================
+                    # PRIMARY TARGET: Corner Brackets with Callout
+                    # ============================================================
+                    if peak_index == 1:
+                        # Pulsing effect simulation (using time-based alpha would be better)
+                        bracket_size = 45
+                        
+                        # Draw corner brackets (primary target - bright color)
+                        self._draw_corner_brackets(frame, peak_video_x, peak_video_y, 
+                                                   bracket_size, color, thickness=2)
+                        
+                        # Draw outer glow brackets (larger, dimmer)
+                        glow_color = tuple(int(c * 0.4) for c in color)
+                        self._draw_corner_brackets(frame, peak_video_x, peak_video_y, 
+                                                   bracket_size + 8, glow_color, thickness=1)
+                        
+                        # Center dot
+                        cv2.circle(frame, (peak_video_x, peak_video_y), 4, color, -1, cv2.LINE_AA)
+                        cv2.circle(frame, (peak_video_x, peak_video_y), 6, color, 1, cv2.LINE_AA)
+                        
+                        # Callout box with info
+                        power_text = f"PWR: {peak['power_db']:.1f} dB"
+                        pos_text = f"POS: ({peak_x_m*100:.1f}, {peak_y_m*100:.1f}) cm"
+                        freq_text = f"SRC: #{peak_index}"
+                        
+                        # Determine callout direction based on position
+                        direction = 'right' if peak_video_x < video_w // 2 else 'left'
+                        self._draw_callout_box(frame, peak_video_x, peak_video_y, 
+                                              [freq_text, power_text, pos_text], color, direction)
+                    
+                    # ============================================================
+                    # SECONDARY TARGETS: Diamond markers (smaller, dimmer)
+                    # ============================================================
+                    else:
+                        # Dimmer color for secondary targets
+                        dim_color = tuple(int(c * 0.7) for c in color)
+                        
+                        # Diamond marker
+                        self._draw_diamond_marker(frame, peak_video_x, peak_video_y, 15, dim_color, 2)
+                        self._draw_diamond_marker(frame, peak_video_x, peak_video_y, 20, 
+                                                  tuple(int(c * 0.3) for c in color), 1)
+                        
+                        # Small center dot
+                        cv2.circle(frame, (peak_video_x, peak_video_y), 2, dim_color, -1, cv2.LINE_AA)
+                        
+                        # Small label
+                        label = f"#{peak_index}"
+                        cv2.putText(frame, label, (peak_video_x + 18, peak_video_y - 8), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 2, cv2.LINE_AA)
+                        cv2.putText(frame, label, (peak_video_x + 18, peak_video_y - 8), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, dim_color, 1, cv2.LINE_AA)
+            
+            # Kayıt için frame'i kaydet
+            if self.is_recording:
+                self._record_frame(frame)
             
             # Display frame
             self._display_image(frame)
@@ -1910,14 +2565,39 @@ def main():
     
     app = QApplication(sys.argv)
     
-    # Stil ayarları
-    app.setStyle('Fusion')
+    # Dark Theme entegrasyonu (pyqtdarktheme)
+    try:
+        import qdarktheme
+        app.setStyleSheet(qdarktheme.load_stylesheet("dark"))
+        logger.info("Dark theme başarıyla yüklendi")
+    except ImportError:
+        logger.warning("pyqtdarktheme bulunamadı, varsayılan stil kullanılıyor")
+        # Fallback: Fusion stili
+        app.setStyle('Fusion')
+        
+        # Manuel dark palette
+        from PySide6.QtGui import QPalette, QColor
+        dark_palette = QPalette()
+        dark_palette.setColor(QPalette.Window, QColor(53, 53, 53))
+        dark_palette.setColor(QPalette.WindowText, Qt.white)
+        dark_palette.setColor(QPalette.Base, QColor(35, 35, 35))
+        dark_palette.setColor(QPalette.AlternateBase, QColor(53, 53, 53))
+        dark_palette.setColor(QPalette.ToolTipBase, QColor(25, 25, 25))
+        dark_palette.setColor(QPalette.ToolTipText, Qt.white)
+        dark_palette.setColor(QPalette.Text, Qt.white)
+        dark_palette.setColor(QPalette.Button, QColor(53, 53, 53))
+        dark_palette.setColor(QPalette.ButtonText, Qt.white)
+        dark_palette.setColor(QPalette.BrightText, Qt.red)
+        dark_palette.setColor(QPalette.Link, QColor(42, 130, 218))
+        dark_palette.setColor(QPalette.Highlight, QColor(42, 130, 218))
+        dark_palette.setColor(QPalette.HighlightedText, QColor(35, 35, 35))
+        app.setPalette(dark_palette)
     
     # Ana pencereyi oluştur
     window = AcousticCameraGUI()
     window.show()
     
-    sys.exit(app.exec_())
+    sys.exit(app.exec())
 
 
 if __name__ == '__main__':

@@ -3,6 +3,13 @@ numpy>=1.21.0
 scipy>=1.7.0
 matplotlib>=3.4.0
 
+# GUI Dark Theme
+pyqtdarktheme>=2.1.0
+
+# 3D Visualization (OpenGL)
+PyOpenGL>=3.1.0
+PyOpenGL-accelerate>=3.1.0
+
 # Audio Processing
 sounddevice>=0.4.6
 soundfile>=0.11.0
