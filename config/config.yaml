@@ -61,9 +61,9 @@ video:
   
   # Kamera kalibrasyonu (opsiyonel)
   calibration:
-    enable: false
-    fov: 60                   # Derece - Field of view
-    position: [0.0, 0.0, 0.0] # Kameranın mikrofon dizisine göre pozisyonu
+    enable: true
+    fov: 100                  # Derece - Field of view (yatay)
+    position: [0.0, 0.0, 0.0] # Kameranın mikrofon dizisine göre pozisyonu (metre)
 
 # ===== Görselleştirme =====
 visualization:

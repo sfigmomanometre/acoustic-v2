@@ -258,15 +258,11 @@ class AcousticCameraGUI(QMainWindow):
         audio_group = self._create_audio_group()
         layout.addWidget(audio_group)
         
-        # 4. OVERLAY AYARLARI (Ayrı grup)
+        # 4. OVERLAY AYARLARI (Renk haritası dahil)
         overlay_group = self._create_overlay_group()
         layout.addWidget(overlay_group)
         
-        # 5. RENK HARİTASI (En altta)
-        colormap_group = self._create_colormap_group()
-        layout.addWidget(colormap_group)
-        
-        # 6. KAYIT & DOSYA YÜKLEME
+        # 5. KAYIT & DOSYA YÜKLEME
         file_group = self._create_file_operations_group()
         layout.addWidget(file_group)
         
@@ -277,7 +273,7 @@ class AcousticCameraGUI(QMainWindow):
     
     def _create_connection_group(self) -> QGroupBox:
         """Bağlantı ayarları grubu - Sistemdeki gerçek cihazları listeler"""
-        group = QGroupBox("🔌 Bağlantı Ayarları")
+        group = QGroupBox("Bağlantı Ayarları")
         layout = QVBoxLayout()
         layout.setSpacing(8)
         layout.setContentsMargins(10, 15, 10, 10)
@@ -289,11 +285,6 @@ class AcousticCameraGUI(QMainWindow):
         self._populate_audio_devices()
         layout.addWidget(self.audio_device_combo)
         
-        # Refresh audio devices button
-        refresh_audio_btn = QPushButton("🔄 Mikrofon Listesini Yenile")
-        refresh_audio_btn.clicked.connect(lambda: self._populate_audio_devices())
-        layout.addWidget(refresh_audio_btn)
-        
         # Video cihaz seçimi - Sistemdeki kameraları listele
         layout.addWidget(QLabel("Kamera:"))
         self.video_device_combo = QComboBox()
@@ -301,10 +292,10 @@ class AcousticCameraGUI(QMainWindow):
         self._populate_video_devices()
         layout.addWidget(self.video_device_combo)
         
-        # Refresh video devices button
-        refresh_video_btn = QPushButton("🔄 Kamera Listesini Yenile")
-        refresh_video_btn.clicked.connect(lambda: self._populate_video_devices())
-        layout.addWidget(refresh_video_btn)
+        # Refresh both audio and video devices button
+        refresh_btn = QPushButton("Bağlantı Seçeneklerini Yenile")
+        refresh_btn.clicked.connect(self._refresh_all_devices)
+        layout.addWidget(refresh_btn)
         
         # Bağlantı durumu - tek satırda özet
         status_frame = QFrame()
@@ -314,14 +305,14 @@ class AcousticCameraGUI(QMainWindow):
         status_layout.setSpacing(2)
         status_layout.setContentsMargins(8, 6, 8, 6)
         
-        self.audio_status_label = QLabel("🔴 Mikrofon: Bağlı değil")
-        self.video_status_label = QLabel("🔴 Kamera: Bağlı değil")
+        self.audio_status_label = QLabel("Mikrofon: Bağlı değil")
+        self.video_status_label = QLabel("Kamera: Bağlı değil")
         status_layout.addWidget(self.audio_status_label)
         status_layout.addWidget(self.video_status_label)
         layout.addWidget(status_frame)
         
         # Başlat/Durdur butonu
-        self.start_stop_btn = QPushButton("▶️ BAŞLAT")
+        self.start_stop_btn = QPushButton("BAŞLAT")
         self.start_stop_btn.setMinimumHeight(50)
         self.start_stop_btn.setStyleSheet("""
             QPushButton {
@@ -403,9 +394,14 @@ class AcousticCameraGUI(QMainWindow):
         else:
             self.video_device_combo.addItem("Kamera bulunamadı", -1)
     
+    def _refresh_all_devices(self):
+        """Hem mikrofon hem de kamera listelerini yenile"""
+        self._populate_audio_devices()
+        self._populate_video_devices()
+    
     def _create_audio_group(self) -> QGroupBox:
         """Ses işleme ayarları grubu"""
-        group = QGroupBox("🎤 Ses Ayarları")
+        group = QGroupBox("Ses Ayarları")
         layout = QVBoxLayout()
         layout.setSpacing(8)
         layout.setContentsMargins(10, 15, 10, 10)
@@ -426,40 +422,12 @@ class AcousticCameraGUI(QMainWindow):
         self.chunk_size_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         layout.addWidget(self.chunk_size_spin)
         
-        # Filtreleme
-        filter_layout = QHBoxLayout()
-        filter_layout.setSpacing(15)
-        self.highpass_check = QCheckBox("Highpass")
-        self.highpass_check.setChecked(True)
-        self.lowpass_check = QCheckBox("Lowpass")
-        self.lowpass_check.setChecked(True)
-        filter_layout.addWidget(self.highpass_check)
-        filter_layout.addWidget(self.lowpass_check)
-        filter_layout.addStretch()
-        layout.addLayout(filter_layout)
-        
-        # Highpass cutoff
-        layout.addWidget(QLabel("Highpass Cutoff (Hz):"))
-        self.highpass_spin = QSpinBox()
-        self.highpass_spin.setRange(10, 1000)
-        self.highpass_spin.setValue(100)
-        self.highpass_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        layout.addWidget(self.highpass_spin)
-        
-        # Lowpass cutoff
-        layout.addWidget(QLabel("Lowpass Cutoff (Hz):"))
-        self.lowpass_spin = QSpinBox()
-        self.lowpass_spin.setRange(1000, 24000)
-        self.lowpass_spin.setValue(10000)
-        self.lowpass_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        layout.addWidget(self.lowpass_spin)
-        
         group.setLayout(layout)
         return group
     
     def _create_parameters_algorithms_group(self) -> QGroupBox:
         """Parametreler & Algoritmalar - Beamforming ayarları"""
-        group = QGroupBox("⚙️ Parametreler & Algoritmalar")
+        group = QGroupBox("Parametreler & Algoritmalar")
         layout = QVBoxLayout()
         layout.setSpacing(8)
         layout.setContentsMargins(10, 15, 10, 10)
@@ -470,15 +438,32 @@ class AcousticCameraGUI(QMainWindow):
         viz_control_layout = QVBoxLayout()
         viz_control_layout.setSpacing(6)
         
-        self.enable_spectrogram_check = QCheckBox("Spektrogram Aktif")
+        # Spektrogram satırı
+        spectrogram_row = QHBoxLayout()
+        self.enable_spectrogram_check = QCheckBox("Spektrogram")
         self.enable_spectrogram_check.setChecked(True)
-        self.enable_spectrogram_check.setToolTip("Spektrogramı aç/kapat (CPU tasarrufu)")
-        viz_control_layout.addWidget(self.enable_spectrogram_check)
+        self.enable_spectrogram_check.setToolTip("Spektrogramı aç/kapat")
+        spectrogram_row.addWidget(self.enable_spectrogram_check)
+        spectrogram_row.addStretch()
+        self.spectrogram_raw_check = QCheckBox("Ham Veri")
+        self.spectrogram_raw_check.setChecked(False)
+        self.spectrogram_raw_check.setToolTip("Filtresiz ham veriyi göster")
+        spectrogram_row.addWidget(self.spectrogram_raw_check)
+        viz_control_layout.addLayout(spectrogram_row)
         
-        self.enable_fft_check = QCheckBox("FFT Spektrum Aktif")
+        # FFT Spektrum satırı
+        fft_row = QHBoxLayout()
+        self.enable_fft_check = QCheckBox("FFT Spektrum")
         self.enable_fft_check.setChecked(True)
-        self.enable_fft_check.setToolTip("FFT spektrumunu aç/kapat (CPU tasarrufu)")
-        viz_control_layout.addWidget(self.enable_fft_check)
+        self.enable_fft_check.setToolTip("FFT spektrumunu aç/kapat")
+        fft_row.addWidget(self.enable_fft_check)
+        fft_row.addStretch()
+        self.fft_raw_check = QCheckBox("Ham Veri")
+        self.fft_raw_check.setChecked(False)
+        self.fft_raw_check.setToolTip("Filtresiz ham veriyi göster")
+        self.fft_raw_check.stateChanged.connect(self._on_filter_changed)  # Cutoff çizgilerini güncelle
+        fft_row.addWidget(self.fft_raw_check)
+        viz_control_layout.addLayout(fft_row)
         
         self.enable_beamforming_check = QCheckBox("Beamforming Aktif")
         self.enable_beamforming_check.setChecked(False)  # Başlangıçta kapalı
@@ -530,6 +515,63 @@ class AcousticCameraGUI(QMainWindow):
         self.db_range_slider.rangeChanged.connect(self.on_db_range_changed)
         layout.addWidget(self.db_range_slider)
         
+        # ============================================================
+        # SİNYAL ÖN İŞLEME / FİLTRELEME BÖLÜMÜ
+        # ============================================================
+        filter_separator = QLabel("<b>Sinyal Ön İşleme / Filtreleme:</b>")
+        filter_separator.setStyleSheet("margin-top: 10px;")
+        layout.addWidget(filter_separator)
+        
+        # DC Offset Kaldırma
+        self.dc_removal_check = QCheckBox("DC Offset Kaldır")
+        self.dc_removal_check.setChecked(True)
+        self.dc_removal_check.setToolTip("Sinyalden DC bileşenini (ortalamayı) çıkarır")
+        layout.addWidget(self.dc_removal_check)
+        
+        # Bandpass Filtre
+        self.bandpass_check = QCheckBox("Bandpass Filtre Aktif")
+        self.bandpass_check.setChecked(True)
+        self.bandpass_check.setToolTip("Belirtilen frekans aralığı dışındaki sinyalleri filtreler")
+        self.bandpass_check.stateChanged.connect(self._on_filter_changed)
+        layout.addWidget(self.bandpass_check)
+        
+        # Cutoff Frekansları
+        cutoff_layout = QHBoxLayout()
+        cutoff_layout.setSpacing(5)
+        
+        # Min (Highpass) frekans
+        self.filter_min_spin = QSpinBox()
+        self.filter_min_spin.setRange(0, 2000)
+        self.filter_min_spin.setValue(200)
+        self.filter_min_spin.setSuffix(" Hz")
+        self.filter_min_spin.setToolTip("Highpass: Bu frekansın altı kesilir")
+        self.filter_min_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.filter_min_spin.valueChanged.connect(self._on_filter_changed)
+        
+        # Max (Lowpass) frekans
+        self.filter_max_spin = QSpinBox()
+        self.filter_max_spin.setRange(2000, 40000)
+        self.filter_max_spin.setValue(20000)
+        self.filter_max_spin.setSuffix(" Hz")
+        self.filter_max_spin.setToolTip("Lowpass: Bu frekansın üstü kesilir")
+        self.filter_max_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.filter_max_spin.valueChanged.connect(self._on_filter_changed)
+        
+        cutoff_layout.addWidget(QLabel("Min:"))
+        cutoff_layout.addWidget(self.filter_min_spin)
+        cutoff_layout.addWidget(QLabel("Max:"))
+        cutoff_layout.addWidget(self.filter_max_spin)
+        layout.addLayout(cutoff_layout)
+        
+        # Spectral Whitening
+        self.whitening_check = QCheckBox("Spectral Whitening (Beyazlatma)")
+        self.whitening_check.setChecked(False)
+        self.whitening_check.setToolTip("Reverberasyonlu ortamlar için spektral beyazlatma uygular")
+        layout.addWidget(self.whitening_check)
+        
+        # Filtre parametreleri arası boşluk
+        layout.addSpacing(5)
+        
         # Grid çözünürlüğü
         layout.addWidget(QLabel("Grid Çözünürlüğü (cm):"))
         self.grid_resolution_spin = QDoubleSpinBox()
@@ -565,8 +607,8 @@ class AcousticCameraGUI(QMainWindow):
         return group
     
     def _create_overlay_group(self) -> QGroupBox:
-        """Overlay ayarları grubu - ayrı"""
-        group = QGroupBox("🎨 Overlay Ayarları")
+        """Overlay ayarları grubu - renk haritası dahil"""
+        group = QGroupBox("Overlay Ayarları")
         layout = QVBoxLayout()
         layout.setSpacing(8)
         layout.setContentsMargins(10, 15, 10, 10)
@@ -576,6 +618,16 @@ class AcousticCameraGUI(QMainWindow):
         self.enable_overlay_check.setChecked(True)
         self.enable_overlay_check.setToolTip("Akustik ısı haritasını video üzerine bindirmeyi aç/kapat")
         layout.addWidget(self.enable_overlay_check)
+        
+        # Renk Paleti
+        layout.addWidget(QLabel("Renk Paleti:"))
+        self.colormap_combo = QComboBox()
+        self.colormap_combo.addItems([
+            "jet", "hot", "viridis", "plasma", "inferno",
+            "coolwarm", "rainbow", "turbo"
+        ])
+        self.colormap_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        layout.addWidget(self.colormap_combo)
         
         # Overlay alpha
         layout.addWidget(QLabel("Overlay Şeffaflığı:"))
@@ -595,28 +647,9 @@ class AcousticCameraGUI(QMainWindow):
         group.setLayout(layout)
         return group
     
-    def _create_colormap_group(self) -> QGroupBox:
-        """Renk haritası grubu - en altta"""
-        group = QGroupBox("🌈 Renk Haritası")
-        layout = QVBoxLayout()
-        layout.setSpacing(8)
-        layout.setContentsMargins(10, 15, 10, 10)
-        
-        layout.addWidget(QLabel("Renk Paleti:"))
-        self.colormap_combo = QComboBox()
-        self.colormap_combo.addItems([
-            "jet", "hot", "viridis", "plasma", "inferno",
-            "coolwarm", "rainbow", "turbo"
-        ])
-        self.colormap_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        layout.addWidget(self.colormap_combo)
-        
-        group.setLayout(layout)
-        return group
-    
     def _create_file_operations_group(self) -> QGroupBox:
         """Dosya işlemleri: Kayıt + Yükleme"""
-        group = QGroupBox("💾 Dosya İşlemleri")
+        group = QGroupBox("Dosya İşlemleri")
         layout = QVBoxLayout()
         layout.setSpacing(8)
         layout.setContentsMargins(10, 15, 10, 10)
@@ -625,12 +658,12 @@ class AcousticCameraGUI(QMainWindow):
         layout.addWidget(QLabel("<b>Dosya Yükle:</b>"))
         
         # Ses dosyası yükle
-        self.load_audio_btn = QPushButton("📂 Ses Dosyası Yükle (.wav)")
+        self.load_audio_btn = QPushButton("Ses Dosyası Yükle (.wav)")
         self.load_audio_btn.clicked.connect(self.load_audio_file)
         layout.addWidget(self.load_audio_btn)
         
         # Video dosyası yükle
-        self.load_video_btn = QPushButton("📂 Video Yükle (.mp4)")
+        self.load_video_btn = QPushButton("Video Yükle (.mp4)")
         self.load_video_btn.clicked.connect(self.load_video_file)
         layout.addWidget(self.load_video_btn)
         
@@ -650,7 +683,7 @@ class AcousticCameraGUI(QMainWindow):
         layout.addWidget(QLabel("<b>Kayıt:</b>"))
         
         # Kayıt butonu
-        self.record_btn = QPushButton("🔴 KAYIT BAŞLAT")
+        self.record_btn = QPushButton("KAYIT BAŞLAT")
         self.record_btn.setMinimumHeight(45)
         self.record_btn.setStyleSheet("""
             QPushButton {
@@ -668,7 +701,7 @@ class AcousticCameraGUI(QMainWindow):
         layout.addWidget(self.record_btn)
         
         # Snapshot butonu
-        self.snapshot_btn = QPushButton("📸 Ekran Görüntüsü Al")
+        self.snapshot_btn = QPushButton("Ekran Görüntüsü Al")
         self.snapshot_btn.clicked.connect(self.take_snapshot)
         layout.addWidget(self.snapshot_btn)
         
@@ -683,9 +716,15 @@ class AcousticCameraGUI(QMainWindow):
         self.record_data_check = QCheckBox("Ham veri kaydet (.h5)")
         self.record_data_check.setChecked(False)
         
+        # Timelapse modu
+        self.record_timelapse_check = QCheckBox("Hızlandırılmış video (timelapse)")
+        self.record_timelapse_check.setChecked(True)
+        self.record_timelapse_check.setToolTip("Aktif: Her 3 frame'de 1 kaydet (3x hızlı)\nPasif: Gerçek zamanlı kayıt")
+        
         layout.addWidget(self.record_audio_check)
         layout.addWidget(self.record_video_check)
         layout.addWidget(self.record_viz_check)
+        layout.addWidget(self.record_timelapse_check)
         layout.addWidget(self.record_data_check)
         
         # Kayıt süresi ve dosya bilgisi
@@ -696,9 +735,9 @@ class AcousticCameraGUI(QMainWindow):
         record_info_layout.setSpacing(4)
         record_info_layout.setContentsMargins(8, 8, 8, 8)
         
-        self.record_time_label = QLabel("⏱ Kayıt Süresi: 00:00:00")
+        self.record_time_label = QLabel("Kayıt Süresi: 00:00:00")
         self.record_time_label.setStyleSheet("font-weight: bold; color: #e74c3c;")
-        self.record_file_label = QLabel("📁 Kayıt dosyası: -")
+        self.record_file_label = QLabel("Kayıt dosyası: -")
         self.record_file_label.setWordWrap(True)
         self.record_file_label.setStyleSheet("font-size: 10px; color: #888;")
         
@@ -727,7 +766,7 @@ class AcousticCameraGUI(QMainWindow):
         analysis_splitter = QSplitter(Qt.Horizontal)
         
         # Spektrogram - Real-time widget
-        spectrogram_group = QGroupBox("📊 Spektrogram (Frekans-Zaman)")
+        spectrogram_group = QGroupBox("Spektrogram (Frekans-Zaman)")
         spec_layout = QVBoxLayout()
         spec_layout.setContentsMargins(2, 2, 2, 2)
         self.spectrogram_widget = SpectrogramWidget(sample_rate=48000, window_duration=5.0)
@@ -736,11 +775,21 @@ class AcousticCameraGUI(QMainWindow):
         spectrogram_group.setLayout(spec_layout)
         
         # Waveform - Real-time widget
-        waveform_group = QGroupBox("📈 FFT Spektrum (Frekans-Genlik)")
+        waveform_group = QGroupBox("FFT Spektrum (Frekans-Genlik)")
         wave_layout = QVBoxLayout()
         wave_layout.setContentsMargins(2, 2, 2, 2)
         self.waveform_widget = WaveformWidget(sample_rate=48000, fft_size=2048)
         self.waveform_widget.setMinimumSize(400, 200)
+        
+        # Başlangıçta filtre cutoff çizgilerini ayarla
+        if hasattr(self, 'filter_min_spin') and hasattr(self, 'bandpass_check'):
+            if self.bandpass_check.isChecked():
+                self.waveform_widget.set_filter_cutoffs(
+                    self.filter_min_spin.value(), 
+                    self.filter_max_spin.value(), 
+                    visible=True
+                )
+        
         wave_layout.addWidget(self.waveform_widget)
         waveform_group.setLayout(wave_layout)
         
@@ -1276,7 +1325,7 @@ class AcousticCameraGUI(QMainWindow):
             logger.error(f"Webcam açılamadı! (ID: {video_device_id})")
             QMessageBox.warning(self, "Webcam Hatası", 
                                f"Video cihazı açılamadı! (ID: {video_device_id})\nLütfen kamera bağlantısını kontrol edin.")
-            self.video_status_label.setText("🔴 Kamera: Hata")
+            self.video_status_label.setText("Kamera: Hata")
             self.video_capture = None
         else:
             # Kamera bilgilerini al
@@ -1286,14 +1335,14 @@ class AcousticCameraGUI(QMainWindow):
             backend = self.video_capture.getBackendName()
             
             self.connected_video_device_name = f"{video_device_text}"
-            self.video_status_label.setText(f"🟢 Kamera: {width}x{height}@{fps}fps")
+            self.video_status_label.setText(f"Kamera: {width}x{height}@{fps}fps")
             logger.info(f"Webcam başarıyla açıldı: {width}x{height}@{fps}fps")
         
         # Audio stream'i başlat
         self._start_audio_stream()
         
         # UI güncellemeleri
-        self.start_stop_btn.setText("⏸️ DURDUR")
+        self.start_stop_btn.setText("DURDUR")
         self.start_stop_btn.setStyleSheet("""
             QPushButton {
                 background-color: #f44336;
@@ -1334,7 +1383,7 @@ class AcousticCameraGUI(QMainWindow):
             logger.info("Webcam kapatıldı")
         
         # UI güncellemeleri
-        self.start_stop_btn.setText("▶️ BAŞLAT")
+        self.start_stop_btn.setText("BAŞLAT")
         self.start_stop_btn.setStyleSheet("""
             QPushButton {
                 background-color: #4CAF50;
@@ -1345,8 +1394,8 @@ class AcousticCameraGUI(QMainWindow):
             }
         """)
         
-        self.audio_status_label.setText("🔴 Mikrofon: Bağlı değil")
-        self.video_status_label.setText("🔴 Kamera: Bağlı değil")
+        self.audio_status_label.setText("Mikrofon: Bağlı değil")
+        self.video_status_label.setText("Kamera: Bağlı değil")
         self.connected_audio_device_name = ""
         self.connected_video_device_name = ""
         
@@ -1369,7 +1418,7 @@ class AcousticCameraGUI(QMainWindow):
                     logger.error("UMA-16 cihazı bulunamadı!")
                     QMessageBox.warning(self, "Audio Hatası", 
                                        "UMA-16 cihazı bulunamadı!\nLütfen cihaz bağlantısını kontrol edin.")
-                    self.audio_status_label.setText("🔴 Mikrofon: Cihaz bulunamadı")
+                    self.audio_status_label.setText("Mikrofon: Cihaz bulunamadı")
                     return
             
             logger.info(f"Audio cihaz açılıyor: {device_name} (ID: {device_index})")
@@ -1400,14 +1449,14 @@ class AcousticCameraGUI(QMainWindow):
             self.connected_audio_device_name = device_info['name']
             # İsmi kısalt (ilk 20 karakter)
             short_name = self.connected_audio_device_name[:25] + "..." if len(self.connected_audio_device_name) > 25 else self.connected_audio_device_name
-            self.audio_status_label.setText(f"🟢 Mikrofon: {num_channels}ch @ 48kHz")
+            self.audio_status_label.setText(f"Mikrofon: {num_channels}ch @ 48kHz")
             logger.info(f"Audio stream başlatıldı: {self.connected_audio_device_name}")
             
         except Exception as e:
             error_msg = f"Audio stream başlatılamadı: {str(e)}"
             logger.error(error_msg)
             QMessageBox.warning(self, "Audio Hatası", error_msg)
-            self.audio_status_label.setText("🔴 Mikrofon: Hata")
+            self.audio_status_label.setText("Mikrofon: Hata")
     
     def _stop_audio_stream(self):
         """Audio stream thread'ini durdur"""
@@ -1443,7 +1492,7 @@ class AcousticCameraGUI(QMainWindow):
     def _on_audio_error(self, error_msg: str):
         """Audio stream hata mesajı"""
         logger.error(f"Audio error: {error_msg}")
-        self.audio_status_label.setText("🔴 Mikrofon: Hata")
+        self.audio_status_label.setText("Mikrofon: Hata")
     
     def _update_visualizations(self, audio_data: np.ndarray, sample_rate: int):
         """
@@ -1470,7 +1519,14 @@ class AcousticCameraGUI(QMainWindow):
                 self.audio_thread is not None):
                 buffer_data = self.audio_thread.get_buffer_data(duration=5.0)
                 if buffer_data is not None and len(buffer_data) > 0:
-                    self.spectrogram_widget.update_data(buffer_data)
+                    # Ham veri mi filtrelenmiş veri mi?
+                    if hasattr(self, 'spectrogram_raw_check') and self.spectrogram_raw_check.isChecked():
+                        # Ham veri göster
+                        self.spectrogram_widget.update_data(buffer_data)
+                    else:
+                        # Filtrelenmiş veri göster
+                        filtered_data = self._preprocess_audio_signal(buffer_data, sample_rate)
+                        self.spectrogram_widget.update_data(filtered_data)
             
             # FFT Spektrum güncelle (checkbox aktif ise)
             if (self.enable_fft_check.isChecked() and 
@@ -1478,7 +1534,14 @@ class AcousticCameraGUI(QMainWindow):
                 self.audio_thread is not None):
                 buffer_data = self.audio_thread.get_buffer_data(duration=0.2)  # 0.2 saniye yeterli FFT için
                 if buffer_data is not None and len(buffer_data) > 0:
-                    self.waveform_widget.update_data(buffer_data)
+                    # Ham veri mi filtrelenmiş veri mi?
+                    if hasattr(self, 'fft_raw_check') and self.fft_raw_check.isChecked():
+                        # Ham veri göster
+                        self.waveform_widget.update_data(buffer_data)
+                    else:
+                        # Filtrelenmiş veri göster
+                        filtered_data = self._preprocess_audio_signal(buffer_data, sample_rate)
+                        self.waveform_widget.update_data(filtered_data)
             
             # Beamforming güncelle (throttled - daha az sıklıkta)
             self.beamforming_counter += 1
@@ -1521,7 +1584,12 @@ class AcousticCameraGUI(QMainWindow):
         self.record_dir = records_dir / self.record_base_name
         self.record_dir.mkdir(exist_ok=True)
         
-        # Video writer başlat (overlay dahil)
+        # Timelapse frame counter
+        self._record_frame_counter = 0
+        self._recorded_frames = []  # Frame'leri kayıt bitiminde yazmak için sakla
+        self.timelapse_skip = 3 if self.record_timelapse_check.isChecked() else 1  # Her N frame'de 1 kaydet
+        
+        # Video boyutlarını belirle
         if self.record_video_check.isChecked() and self.video_capture is not None:
             width = int(self.video_capture.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(self.video_capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -1530,15 +1598,15 @@ class AcousticCameraGUI(QMainWindow):
             if self.record_viz_check.isChecked():
                 # Video + Spektrogram + FFT yan yana
                 total_width = width
-                total_height = height + 200  # Alt kısma görselleştirmeler
+                total_height = height + 350  # Alt kısma görselleştirmeler (daha yüksek = daha net)
             else:
                 total_width = width
                 total_height = height
             
-            video_path = str(self.record_dir / f"{self.record_base_name}.mp4")
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            self.video_writer = cv2.VideoWriter(video_path, fourcc, 30.0, (total_width, total_height))
-            logger.info(f"Video kayıt başladı: {video_path}")
+            self.record_video_path = str(self.record_dir / f"{self.record_base_name}.mp4")
+            self.record_video_size = (total_width, total_height)
+            self.video_writer = True  # Flag olarak kullan, gerçek writer kayıt bitiminde oluşturulacak
+            logger.info(f"Video kayıt başladı (frame buffer): timelapse_skip={self.timelapse_skip})")
         
         # Audio buffer'ı temizle
         self.audio_record_buffer = []
@@ -1551,7 +1619,7 @@ class AcousticCameraGUI(QMainWindow):
         self.record_timer.start(1000)  # Her saniye güncelle
         
         # UI güncelle
-        self.record_btn.setText("⏹️ KAYIT DURDUR")
+        self.record_btn.setText("KAYIT DURDUR")
         self.record_btn.setStyleSheet("""
             QPushButton {
                 background-color: #27ae60;
@@ -1565,8 +1633,8 @@ class AcousticCameraGUI(QMainWindow):
                 background-color: #2ecc71;
             }
         """)
-        self.record_file_label.setText(f"📁 Kayıt: {self.record_base_name}")
-        self.statusbar.showMessage("🔴 Kayıt yapılıyor...")
+        self.record_file_label.setText(f"Kayıt: {self.record_base_name}")
+        self.statusbar.showMessage("Kayıt yapılıyor...")
     
     def stop_recording(self):
         """Kaydı durdur ve dosyaları kaydet"""
@@ -1577,11 +1645,50 @@ class AcousticCameraGUI(QMainWindow):
         self.is_recording = False
         self.record_timer.stop()
         
-        # Video writer'ı kapat
-        if self.video_writer is not None:
-            self.video_writer.release()
-            self.video_writer = None
-            logger.info("Video kayıt tamamlandı")
+        # Kayıt süresini hesapla
+        record_duration = time.time() - self.record_start_time if self.record_start_time else 1.0
+        
+        # Video yaz - gerçek FPS hesapla ve frame'leri yaz
+        if self.video_writer is not None and hasattr(self, '_recorded_frames') and len(self._recorded_frames) > 0:
+            try:
+                # Gerçek FPS = kaydedilen frame sayısı / kayıt süresi
+                num_frames = len(self._recorded_frames)
+                real_fps = num_frames / record_duration if record_duration > 0 else 10.0
+                
+                # FPS'i makul bir aralığa sınırla
+                real_fps = max(1.0, min(60.0, real_fps))
+                
+                # Timelapse modunda FPS'i artır (video hızlı oynar)
+                if hasattr(self, 'timelapse_skip') and self.timelapse_skip > 1:
+                    # Timelapse: gerçek FPS * skip = hızlı video
+                    output_fps = real_fps * self.timelapse_skip
+                else:
+                    # Normal: gerçek FPS = gerçek zamanlı video
+                    output_fps = real_fps
+                
+                logger.info(f"Video yazılıyor: {num_frames} frame, gerçek FPS={real_fps:.2f}, çıkış FPS={output_fps:.2f}")
+                
+                # VideoWriter oluştur ve frame'leri yaz
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                video_writer = cv2.VideoWriter(
+                    self.record_video_path, 
+                    fourcc, 
+                    output_fps, 
+                    self.record_video_size
+                )
+                
+                for frame in self._recorded_frames:
+                    video_writer.write(frame)
+                
+                video_writer.release()
+                logger.info(f"Video kayıt tamamlandı: {self.record_video_path}")
+                
+            except Exception as e:
+                logger.error(f"Video yazma hatası: {e}")
+            finally:
+                self._recorded_frames = []  # Belleği temizle
+        
+        self.video_writer = None
         
         # Audio kaydet
         if self.record_audio_check.isChecked() and len(self.audio_record_buffer) > 0:
@@ -1597,7 +1704,7 @@ class AcousticCameraGUI(QMainWindow):
         self.audio_record_buffer = []
         
         # UI güncelle
-        self.record_btn.setText("🔴 KAYIT BAŞLAT")
+        self.record_btn.setText("KAYIT BAŞLAT")
         self.record_btn.setStyleSheet("""
             QPushButton {
                 background-color: #c0392b;
@@ -1616,7 +1723,7 @@ class AcousticCameraGUI(QMainWindow):
             duration = time.time() - self.record_start_time
             mins = int(duration // 60)
             secs = int(duration % 60)
-            self.record_file_label.setText(f"📁 Kaydedildi: {self.record_base_name} ({mins}:{secs:02d})")
+            self.record_file_label.setText(f"Kaydedildi: {self.record_base_name} ({mins}:{secs:02d})")
         
         self.statusbar.showMessage("Kayıt tamamlandı")
         QMessageBox.information(self, "Kayıt Tamamlandı", 
@@ -1629,36 +1736,141 @@ class AcousticCameraGUI(QMainWindow):
             hours = int(elapsed // 3600)
             mins = int((elapsed % 3600) // 60)
             secs = int(elapsed % 60)
-            self.record_time_label.setText(f"⏱ Kayıt Süresi: {hours:02d}:{mins:02d}:{secs:02d}")
+            self.record_time_label.setText(f"Kayıt Süresi: {hours:02d}:{mins:02d}:{secs:02d}")
+    
+    def _widget_to_numpy(self, widget) -> np.ndarray:
+        """
+        Qt Widget'ı numpy array'e dönüştür (BGR format)
+        
+        Args:
+            widget: QWidget instance
+            
+        Returns:
+            numpy array (H, W, 3) BGR format or None if failed
+        """
+        try:
+            from PySide6.QtCore import QBuffer, QIODevice
+            from PySide6.QtGui import QImage
+            import io
+            
+            # Widget'ı pixmap olarak yakala
+            pixmap = widget.grab()
+            
+            # QImage'e dönüştür
+            qimage = pixmap.toImage()
+            
+            # Format kontrolü ve dönüşümü
+            if qimage.format() != QImage.Format.Format_RGB32:
+                qimage = qimage.convertToFormat(QImage.Format.Format_RGB32)
+            
+            # QImage verilerini al
+            width = qimage.width()
+            height = qimage.height()
+            
+            # constBits() kullanarak veriyi al (PySide6 uyumlu)
+            ptr = qimage.constBits()
+            
+            # NumPy array'e dönüştür
+            arr = np.array(ptr).reshape(height, width, 4)
+            
+            # BGRA to BGR (alpha kanalını at)
+            bgr = arr[:, :, :3].copy()
+            
+            # RGB to BGR dönüşümü (Qt RGB32 formatı aslında 0xffRRGGBB)
+            bgr = cv2.cvtColor(bgr, cv2.COLOR_RGB2BGR)
+            
+            return bgr
+            
+        except Exception as e:
+            logger.debug(f"Widget to numpy conversion error: {e}")
+            return None
     
     def _record_frame(self, frame: np.ndarray):
-        """Kayıt için frame ekle"""
+        """Kayıt için frame ekle - timelapse ve görselleştirme desteği ile"""
         if not self.is_recording or self.video_writer is None:
             return
         
         try:
+            # Timelapse kontrolü için frame sayacı kullan (basit ve güvenilir)
+            if not hasattr(self, '_record_frame_counter'):
+                self._record_frame_counter = 0
+            
+            self._record_frame_counter += 1
+            
+            # Timelapse modunda her N frame'de 1 kaydet
+            # timelapse_skip = 1 (normal mod) -> her frame kaydedilir
+            # timelapse_skip = 3 (timelapse mod) -> her 3 frame'de 1 kaydedilir
+            if not hasattr(self, 'timelapse_skip'):
+                self.timelapse_skip = 1
+            
+            if self._record_frame_counter % self.timelapse_skip != 0:
+                return  # Bu frame'i atla
+            
             # Görselleştirmeler dahil edilecekse
             if self.record_viz_check.isChecked():
                 # Ana frame'in altına görselleştirme alanı ekle
                 h, w = frame.shape[:2]
-                viz_height = 200
+                viz_height = 350  # Daha yüksek = daha net görüntü
                 
                 # Yeni büyük frame oluştur
                 combined_frame = np.zeros((h + viz_height, w, 3), dtype=np.uint8)
                 combined_frame[:h, :, :] = frame
                 
-                # Spektrogram ve FFT'yi yakala (widget'lardan)
-                # Bu basitleştirilmiş versiyon - asıl görüntüyü almak için grab kullanılabilir
-                # Şimdilik sadece placeholder
-                combined_frame[h:, :, :] = 30  # Koyu gri arkaplan
+                # Koyu gri arkaplan
+                combined_frame[h:, :, :] = 25
                 
-                # "Spektrogram + FFT" yazısı ekle
-                cv2.putText(combined_frame, "Spektrogram + FFT (Kayit)", (10, h + 30),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
+                # Hedef boyutlar
+                target_w = w // 2
+                target_h = viz_height
                 
-                self.video_writer.write(combined_frame)
+                # Spektrogram widget'ından görüntü al
+                spec_captured = False
+                if hasattr(self, 'spectrogram_widget') and self.spectrogram_widget is not None:
+                    try:
+                        spec_arr = self._widget_to_numpy(self.spectrogram_widget)
+                        if spec_arr is not None:
+                            # Kaliteli resize (LANCZOS4 daha keskin)
+                            spec_resized = cv2.resize(spec_arr, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+                            # Sol tarafa yerleştir
+                            combined_frame[h:h+target_h, 0:target_w, :] = spec_resized
+                            spec_captured = True
+                    except Exception as e:
+                        logger.debug(f"Spektrogram capture error: {e}")
+                
+                if not spec_captured:
+                    cv2.putText(combined_frame, "Spektrogram", (10, h + 175),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 100, 100), 1)
+                
+                # FFT widget'ından görüntü al
+                fft_captured = False
+                if hasattr(self, 'waveform_widget') and self.waveform_widget is not None:
+                    try:
+                        fft_arr = self._widget_to_numpy(self.waveform_widget)
+                        if fft_arr is not None:
+                            # Kaliteli resize (LANCZOS4 daha keskin)
+                            fft_resized = cv2.resize(fft_arr, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+                            # Sağ tarafa yerleştir
+                            combined_frame[h:h+target_h, w//2:w//2+target_w, :] = fft_resized
+                            fft_captured = True
+                    except Exception as e:
+                        logger.debug(f"FFT capture error: {e}")
+                
+                if not fft_captured:
+                    cv2.putText(combined_frame, "FFT Spektrum", (w // 2 + 10, h + 175),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 100, 100), 1)
+                
+                # Ayırıcı çizgi
+                cv2.line(combined_frame, (w // 2, h), (w // 2, h + viz_height), (60, 60, 80), 2)
+                
+                # Frame'i listeye ekle (kayıt bitiminde video yazılacak)
+                if not hasattr(self, '_recorded_frames'):
+                    self._recorded_frames = []
+                self._recorded_frames.append(combined_frame.copy())
             else:
-                self.video_writer.write(frame)
+                # Frame'i listeye ekle
+                if not hasattr(self, '_recorded_frames'):
+                    self._recorded_frames = []
+                self._recorded_frames.append(frame.copy())
                 
         except Exception as e:
             logger.error(f"Frame kayıt hatası: {e}")
@@ -1715,8 +1927,8 @@ class AcousticCameraGUI(QMainWindow):
                 interpolation=cv2.INTER_LINEAR
             )
             
-            # RGB ve alpha ayır
-            heatmap_rgb = heatmap_resized[:, :, :3]
+            # BGR ve alpha ayır (heatmap BGRA formatında)
+            heatmap_bgr = heatmap_resized[:, :, :3]
             heatmap_alpha = heatmap_resized[:, :, 3] / 255.0
             
             # Kullanıcı şeffaflığı
@@ -1725,7 +1937,7 @@ class AcousticCameraGUI(QMainWindow):
             
             # Alpha blending
             alpha_3ch = combined_alpha[:, :, np.newaxis]
-            blended = (frame * (1 - alpha_3ch) + heatmap_rgb * alpha_3ch).astype(np.uint8)
+            blended = (frame * (1 - alpha_3ch) + heatmap_bgr * alpha_3ch).astype(np.uint8)
             
             return blended
             
@@ -1744,6 +1956,29 @@ class AcousticCameraGUI(QMainWindow):
         """dB aralığı değiştiğinde"""
         logger.debug(f"dB aralığı: {min_val} - {max_val} dB")
         # dB range is used in heatmap rendering, no need to rebuild config
+    
+    def _on_filter_changed(self, *args):
+        """Sinyal filtresi parametreleri değiştiğinde"""
+        # Log flag'ını sıfırla ki yeni ayarlar loglanabilsin
+        self._filter_logged = False
+        
+        # Log new settings
+        if hasattr(self, 'bandpass_check') and hasattr(self, 'filter_min_spin'):
+            if self.bandpass_check.isChecked():
+                low_freq = self.filter_min_spin.value()
+                high_freq = self.filter_max_spin.value()
+                logger.info(f"Filtre güncellendi: {low_freq}-{high_freq} Hz")
+                
+                # FFT widget'a cutoff çizgilerini güncelle
+                if hasattr(self, 'waveform_widget') and self.waveform_widget is not None:
+                    # Ham veri modunda çizgileri gizle
+                    show_lines = not (hasattr(self, 'fft_raw_check') and self.fft_raw_check.isChecked())
+                    self.waveform_widget.set_filter_cutoffs(low_freq, high_freq, visible=show_lines)
+            else:
+                logger.info("Bandpass filtre devre dışı")
+                # Filtre kapalı - çizgileri gizle
+                if hasattr(self, 'waveform_widget') and self.waveform_widget is not None:
+                    self.waveform_widget.set_filter_cutoffs(visible=False)
     
     def _on_algorithm_changed(self, algorithm_name):
         """Algoritma değiştiğinde"""
@@ -1808,6 +2043,9 @@ class AcousticCameraGUI(QMainWindow):
                 # Plain video (no overlay)
                 ret, frame = self.video_capture.read()
                 if ret:
+                    # Kayıt aktifse frame'i kaydet
+                    if self.is_recording:
+                        self._record_frame(frame)
                     self._display_image(frame)
                     self.frame_count += 1
             # else: overlay zaten _update_video_overlay()'de gösterildi
@@ -1905,13 +2143,29 @@ class AcousticCameraGUI(QMainWindow):
             focus_distance = self.focus_distance_spin.value()
             grid_resolution = self.grid_resolution_spin.value() / 100.0  # cm to m
             
+            # ============================================================
+            # FOV-based grid size calculation
+            # Camera FOV determines visible area at focus distance
+            # visible_width = 2 * tan(FOV/2) * distance
+            # ============================================================
+            camera_fov_degrees = 100.0  # Horizontal FOV in degrees (from config)
+            camera_fov_rad = np.radians(camera_fov_degrees)
+            
+            # Calculate visible area at focus distance
+            visible_width = 2.0 * np.tan(camera_fov_rad / 2.0) * focus_distance
+            visible_height = visible_width * (9.0 / 16.0)  # Assume 16:9 aspect ratio
+            
+            # Use calculated visible area as grid size
+            grid_size_x = visible_width
+            grid_size_y = visible_height
+            
+            logger.info(f"FOV-based grid: FOV={camera_fov_degrees}°, distance={focus_distance}m, "
+                       f"visible area={grid_size_x:.2f}m x {grid_size_y:.2f}m")
+            
             # Create config
-            # Grid size: larger area to cover more of the camera FOV
-            # At 1m distance, a typical webcam FOV is ~60-80 degrees
-            # This translates to roughly 1.0-1.5m visible area
             self.beamforming_config = BeamformingConfig(
-                grid_size_x=1.2,  # 1.2 meters (120 cm) - wider coverage
-                grid_size_y=1.2,  # 1.2 meters (120 cm)
+                grid_size_x=grid_size_x,
+                grid_size_y=grid_size_y,
                 grid_resolution=grid_resolution,
                 focus_distance=focus_distance,
                 freq_min=float(freq_min),
@@ -1934,6 +2188,91 @@ class AcousticCameraGUI(QMainWindow):
         except Exception as e:
             logger.error(f"Failed to update beamforming config: {e}")
     
+    def _preprocess_audio_signal(self, audio_data: np.ndarray, sample_rate: float) -> np.ndarray:
+        """
+        Sinyal ön işleme: DC removal, bandpass filtering, whitening
+        
+        Args:
+            audio_data: (n_samples, n_mics) ham ses verisi
+            sample_rate: Örnekleme hızı (Hz)
+            
+        Returns:
+            Ön işlenmiş ses verisi
+        """
+        from scipy.signal import butter, sosfiltfilt
+        
+        processed = audio_data.copy()
+        
+        # 1. DC Offset Kaldırma
+        if hasattr(self, 'dc_removal_check') and self.dc_removal_check.isChecked():
+            # Her kanaldan ortalamasını çıkar
+            processed = processed - np.mean(processed, axis=0, keepdims=True)
+        
+        # 2. Bandpass Filtre
+        if hasattr(self, 'bandpass_check') and self.bandpass_check.isChecked():
+            try:
+                low_freq = self.filter_min_spin.value()
+                high_freq = self.filter_max_spin.value()
+                nyquist = sample_rate / 2.0
+                
+                # Minimum sinyal uzunluğu kontrolü (filtfilt için en az 3*padlen gerekli)
+                min_samples = 50  # Minimum örnek sayısı
+                if len(processed) < min_samples:
+                    logger.warning(f"Signal too short for filtering: {len(processed)} samples")
+                    return processed
+                
+                # Normalize frekanslar (0-1 arası, Nyquist'e göre)
+                low_normalized = low_freq / nyquist
+                high_normalized = high_freq / nyquist
+                
+                # Frekans değerlerini geçerli aralıkta tut
+                low_normalized = max(0.005, min(low_normalized, 0.95))
+                high_normalized = max(low_normalized + 0.02, min(high_normalized, 0.995))
+                
+                # Butterworth bandpass filtre tasarla
+                # Daha düşük order = daha smooth geçiş, daha az ringing
+                order = 4
+                sos = butter(order, [low_normalized, high_normalized], btype='band', output='sos')
+                
+                # Zero-phase filtering (sosfiltfilt) - çift yönlü, geçiş yanıtı yok
+                # padlen hesapla (varsayılan 3 * max(len(sos)) ama sinyal kısa olabilir)
+                padlen = min(3 * order, len(processed) - 1)
+                if padlen < 1:
+                    padlen = None  # Varsayılana bırak
+                
+                for ch in range(processed.shape[1]):
+                    try:
+                        processed[:, ch] = sosfiltfilt(sos, processed[:, ch], padlen=padlen)
+                    except ValueError as ve:
+                        # Sinyal çok kısa, padding yapılamıyor
+                        logger.debug(f"Channel {ch} too short for filtfilt: {ve}")
+                        continue
+                
+                # İlk çalışmada log yaz
+                if not hasattr(self, '_filter_logged') or not self._filter_logged:
+                    logger.info(f"Bandpass filter applied: {low_freq}-{high_freq} Hz (order={order}, zero-phase)")
+                    self._filter_logged = True
+                    
+            except Exception as e:
+                logger.warning(f"Bandpass filter error: {e}")
+        
+        # 3. Spectral Whitening (opsiyonel)
+        if hasattr(self, 'whitening_check') and self.whitening_check.isChecked():
+            try:
+                # Basit spektral beyazlatma: FFT -> normalize -> IFFT
+                for ch in range(processed.shape[1]):
+                    fft_data = np.fft.rfft(processed[:, ch])
+                    magnitude = np.abs(fft_data)
+                    # Sıfıra bölmeyi önle
+                    magnitude = np.maximum(magnitude, 1e-10)
+                    # Fazı koru, genliği normalize et
+                    whitened_fft = fft_data / magnitude
+                    processed[:, ch] = np.fft.irfft(whitened_fft, n=len(processed[:, ch]))
+            except Exception as e:
+                logger.warning(f"Whitening error: {e}")
+        
+        return processed
+    
     def _run_beamforming(self, audio_data: np.ndarray, sample_rate: float):
         """
         Run beamforming on audio data and generate heatmap
@@ -1954,6 +2293,11 @@ class AcousticCameraGUI(QMainWindow):
             # Check if beamforming is ready
             if self.mic_positions is None or self.grid_points is None:
                 return
+            
+            # ============================================================
+            # SİNYAL ÖN İŞLEME (DC Removal, Bandpass, Whitening)
+            # ============================================================
+            audio_data = self._preprocess_audio_signal(audio_data, sample_rate)
             
             # Get selected algorithm and n_sources
             algorithm = self.algorithm_combo.currentText()
@@ -2170,33 +2514,36 @@ class AcousticCameraGUI(QMainWindow):
     
     def _power_to_heatmap(self, power_grid: np.ndarray) -> np.ndarray:
         """
-        Convert power grid (dB) to RGB heatmap
+        Convert power grid (dB) to BGR heatmap with alpha channel
         RED = high power (sound source), BLUE = low power (quiet)
+        Only areas with significant sound will be visible (alpha-based transparency)
         
         Args:
             power_grid: (height, width) power in dB
             
         Returns:
-            heatmap: (height, width, 4) RGBA uint8 image (with alpha channel)
+            heatmap: (height, width, 4) BGRA uint8 image (with alpha channel)
         """
         # Get dB range from GUI - use these as reference thresholds
         db_min_ui, db_max_ui = self.db_range_slider.values()
         
+        # Calculate the actual data range
+        data_min = np.min(power_grid)
+        data_max = np.max(power_grid)
+        
         # Use the UI slider values as the normalization range
-        # This allows user to control what power levels map to colors
         # Clip power values to the UI range
         power_clipped = np.clip(power_grid, db_min_ui, db_max_ui)
         
         # Normalize to [0, 1] using UI slider range
-        normalized = (power_clipped - db_min_ui) / (db_max_ui - db_min_ui + 1e-6)
+        db_range = db_max_ui - db_min_ui
+        if db_range < 1e-6:
+            db_range = 1.0
+        normalized = (power_clipped - db_min_ui) / db_range
         normalized = np.clip(normalized, 0, 1)
         
-        # Apply gamma correction to enhance contrast
-        gamma = 0.7
-        normalized_gamma = np.power(normalized, gamma)
-        
         # Apply gaussian smoothing for nicer visual
-        normalized_smooth = gaussian_filter(normalized_gamma, sigma=1.5)
+        normalized_smooth = gaussian_filter(normalized, sigma=1.5)
         
         # Convert to [0, 255] uint8 for colormap
         # HIGH values (loud) should be RED, LOW values (quiet) should be BLUE
@@ -2221,26 +2568,43 @@ class AcousticCameraGUI(QMainWindow):
         cv_colormap = colormap_dict.get(colormap_name, cv2.COLORMAP_JET)
         heatmap_bgr = cv2.applyColorMap(normalized_uint8, cv_colormap)
         
-        # Convert BGR to RGB
-        heatmap_rgb = cv2.cvtColor(heatmap_bgr, cv2.COLOR_BGR2RGB)
+        # ============================================================
+        # Alpha channel: ONLY show where there's significant sound
+        # Low power areas should be FULLY TRANSPARENT
+        # High power areas should be visible
+        # ============================================================
         
-        # Alpha channel: make low power areas more transparent
-        # Only show overlay where there's significant sound
-        # Use a threshold based on normalized value (bottom 30% is mostly transparent)
-        alpha_threshold = 0.25
+        # Use percentile-based threshold to only show top power regions
+        # This ensures only actual sound sources are visible
+        percentile_threshold = 75  # Only show top 25% of power values
+        threshold_value = np.percentile(normalized_smooth, percentile_threshold)
+        
+        # Ensure minimum threshold (at least 0.5 normalized)
+        alpha_threshold = max(threshold_value, 0.5)
+        
+        # Create alpha channel
         alpha = np.zeros_like(normalized_smooth, dtype=np.float32)
+        
+        # Only where power is above threshold
         above_threshold = normalized_smooth > alpha_threshold
-        # Scale alpha from threshold to 1.0
-        alpha[above_threshold] = (normalized_smooth[above_threshold] - alpha_threshold) / (1.0 - alpha_threshold)
         
-        # Apply power curve to alpha for better contrast
-        alpha = np.power(alpha, 0.6)
-        alpha = (alpha * 255).astype(np.uint8)
+        # Scale alpha: threshold→0, 1.0→1.0
+        if np.any(above_threshold):
+            max_val = np.max(normalized_smooth)
+            if max_val > alpha_threshold:
+                alpha[above_threshold] = (normalized_smooth[above_threshold] - alpha_threshold) / (max_val - alpha_threshold)
         
-        # Add alpha channel
-        heatmap_rgba = np.dstack([heatmap_rgb, alpha])
+        # Apply power curve to make high values more prominent
+        alpha = np.power(alpha, 0.7)
         
-        return heatmap_rgba
+        # Clamp and convert to uint8
+        alpha = np.clip(alpha, 0, 1)
+        alpha_uint8 = (alpha * 255).astype(np.uint8)
+        
+        # Add alpha channel (BGR + Alpha = BGRA)
+        heatmap_bgra = np.dstack([heatmap_bgr, alpha_uint8])
+        
+        return heatmap_bgra
     
     def _draw_corner_brackets(self, frame, cx, cy, size, color, thickness=2, gap=8):
         """Draw corner brackets (HUD-style target acquisition)"""
@@ -2345,7 +2709,7 @@ class AcousticCameraGUI(QMainWindow):
                 text_y += line_heights[i + 1] + 3
     
     def _draw_hud_frame_elements(self, frame, video_w, video_h):
-        """Draw HUD frame corner elements and status indicators"""
+        """Draw HUD frame corner elements, status indicators, and source info panel"""
         color = (0, 200, 180)  # Cyan-ish
         
         # Frame corner decorations
@@ -2372,6 +2736,47 @@ class AcousticCameraGUI(QMainWindow):
             y_pos = int(video_h * (0.25 + i * 0.25))
             cv2.line(frame, (15, y_pos), (35, y_pos), color, 1, cv2.LINE_AA)
             cv2.line(frame, (video_w - 35, y_pos), (video_w - 15, y_pos), color, 1, cv2.LINE_AA)
+        
+        # ============================================================
+        # SOURCE INFO PANEL - Top-left corner (below corner decoration)
+        # ============================================================
+        if len(self.detected_peaks) > 0:
+            panel_x = 20
+            panel_y = 80
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.5
+            line_height = 22
+            
+            # Panel background
+            panel_width = 200
+            panel_height = 30 + len(self.detected_peaks) * line_height
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (panel_x, panel_y), 
+                         (panel_x + panel_width, panel_y + panel_height), (20, 20, 30), -1)
+            cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+            
+            # Panel border
+            cv2.rectangle(frame, (panel_x, panel_y), 
+                         (panel_x + panel_width, panel_y + panel_height), color, 1, cv2.LINE_AA)
+            
+            # Header
+            cv2.putText(frame, "DETECTED SOURCES", (panel_x + 10, panel_y + 18), 
+                       font, 0.45, color, 1, cv2.LINE_AA)
+            cv2.line(frame, (panel_x + 5, panel_y + 25), 
+                    (panel_x + panel_width - 5, panel_y + 25), color, 1, cv2.LINE_AA)
+            
+            # List sources
+            for i, peak in enumerate(self.detected_peaks[:5]):  # Max 5 sources
+                text_y = panel_y + 45 + i * line_height
+                src_color = peak.get('color', (0, 255, 0))
+                
+                # Source indicator
+                cv2.circle(frame, (panel_x + 15, text_y - 5), 4, src_color, -1, cv2.LINE_AA)
+                
+                # Source info
+                info_text = f"#{i+1}: {peak['power_db']:.1f}dB ({peak['x']*100:.0f},{peak['y']*100:.0f})cm"
+                cv2.putText(frame, info_text, (panel_x + 25, text_y), 
+                           font, font_scale, (200, 200, 200), 1, cv2.LINE_AA)
     
     def _update_video_overlay(self):
         """Update video frame with acoustic heatmap overlay - HUD Style"""
@@ -2426,8 +2831,8 @@ class AcousticCameraGUI(QMainWindow):
                 self._display_image(frame)
                 return
             
-            # Extract RGB and alpha from heatmap
-            heatmap_rgb = heatmap_resized[:, :, :3]
+            # Extract BGR and alpha from heatmap (BGRA format)
+            heatmap_bgr = heatmap_resized[:, :, :3]
             heatmap_alpha = heatmap_resized[:, :, 3] / 255.0  # Normalize to [0, 1]
             
             # Apply user-defined opacity from slider
@@ -2436,7 +2841,7 @@ class AcousticCameraGUI(QMainWindow):
             
             # Alpha blending: output = roi * (1 - alpha) + heatmap * alpha
             alpha_3ch = combined_alpha[:, :, np.newaxis]
-            blended = (roi * (1 - alpha_3ch) + heatmap_rgb * alpha_3ch).astype(np.uint8)
+            blended = (roi * (1 - alpha_3ch) + heatmap_bgr * alpha_3ch).astype(np.uint8)
             
             # Update frame with blended overlay
             frame[y_offset:y_offset+overlay_h, x_offset:x_offset+overlay_w] = blended
@@ -2473,11 +2878,10 @@ class AcousticCameraGUI(QMainWindow):
                     peak_video_y = int(np.clip(peak_video_y, 50, video_h - 50))
                     
                     # ============================================================
-                    # PRIMARY TARGET: Corner Brackets with Callout
+                    # PRIMARY TARGET: Corner Brackets with Callout (medium size)
                     # ============================================================
                     if peak_index == 1:
-                        # Pulsing effect simulation (using time-based alpha would be better)
-                        bracket_size = 45
+                        bracket_size = 30  # Reduced from 45
                         
                         # Draw corner brackets (primary target - bright color)
                         self._draw_corner_brackets(frame, peak_video_x, peak_video_y, 
@@ -2486,43 +2890,46 @@ class AcousticCameraGUI(QMainWindow):
                         # Draw outer glow brackets (larger, dimmer)
                         glow_color = tuple(int(c * 0.4) for c in color)
                         self._draw_corner_brackets(frame, peak_video_x, peak_video_y, 
-                                                   bracket_size + 8, glow_color, thickness=1)
+                                                   bracket_size + 6, glow_color, thickness=1)
                         
                         # Center dot
-                        cv2.circle(frame, (peak_video_x, peak_video_y), 4, color, -1, cv2.LINE_AA)
-                        cv2.circle(frame, (peak_video_x, peak_video_y), 6, color, 1, cv2.LINE_AA)
+                        cv2.circle(frame, (peak_video_x, peak_video_y), 3, color, -1, cv2.LINE_AA)
+                        cv2.circle(frame, (peak_video_x, peak_video_y), 5, color, 1, cv2.LINE_AA)
                         
-                        # Callout box with info
-                        power_text = f"PWR: {peak['power_db']:.1f} dB"
-                        pos_text = f"POS: ({peak_x_m*100:.1f}, {peak_y_m*100:.1f}) cm"
-                        freq_text = f"SRC: #{peak_index}"
-                        
-                        # Determine callout direction based on position
-                        direction = 'right' if peak_video_x < video_w // 2 else 'left'
-                        self._draw_callout_box(frame, peak_video_x, peak_video_y, 
-                                              [freq_text, power_text, pos_text], color, direction)
+                        # Callout box with info (smaller, moved to side panel instead)
+                        # Only show minimal label near marker
+                        label = f"#1"
+                        cv2.putText(frame, label, (peak_video_x + bracket_size + 5, peak_video_y + 5), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2, cv2.LINE_AA)
+                        cv2.putText(frame, label, (peak_video_x + bracket_size + 5, peak_video_y + 5), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
                     
                     # ============================================================
-                    # SECONDARY TARGETS: Diamond markers (smaller, dimmer)
+                    # SECONDARY TARGETS: Corner brackets (slightly smaller)
                     # ============================================================
                     else:
-                        # Dimmer color for secondary targets
-                        dim_color = tuple(int(c * 0.7) for c in color)
+                        # Slightly dimmer color for secondary targets
+                        dim_color = tuple(int(c * 0.8) for c in color)
+                        bracket_size = 22  # Increased from 15
                         
-                        # Diamond marker
-                        self._draw_diamond_marker(frame, peak_video_x, peak_video_y, 15, dim_color, 2)
-                        self._draw_diamond_marker(frame, peak_video_x, peak_video_y, 20, 
-                                                  tuple(int(c * 0.3) for c in color), 1)
+                        # Draw corner brackets (same style as primary, just smaller)
+                        self._draw_corner_brackets(frame, peak_video_x, peak_video_y, 
+                                                   bracket_size, dim_color, thickness=2)
                         
-                        # Small center dot
-                        cv2.circle(frame, (peak_video_x, peak_video_y), 2, dim_color, -1, cv2.LINE_AA)
+                        # Outer glow
+                        glow_color = tuple(int(c * 0.3) for c in color)
+                        self._draw_corner_brackets(frame, peak_video_x, peak_video_y, 
+                                                   bracket_size + 5, glow_color, thickness=1)
                         
-                        # Small label
+                        # Center dot
+                        cv2.circle(frame, (peak_video_x, peak_video_y), 3, dim_color, -1, cv2.LINE_AA)
+                        
+                        # Label
                         label = f"#{peak_index}"
-                        cv2.putText(frame, label, (peak_video_x + 18, peak_video_y - 8), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 2, cv2.LINE_AA)
-                        cv2.putText(frame, label, (peak_video_x + 18, peak_video_y - 8), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, dim_color, 1, cv2.LINE_AA)
+                        cv2.putText(frame, label, (peak_video_x + bracket_size + 3, peak_video_y + 5), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 2, cv2.LINE_AA)
+                        cv2.putText(frame, label, (peak_video_x + bracket_size + 3, peak_video_y + 5), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.45, dim_color, 1, cv2.LINE_AA)
             
             # Kayıt için frame'i kaydet
             if self.is_recording:

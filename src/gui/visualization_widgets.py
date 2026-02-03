@@ -311,6 +311,22 @@ class WaveformWidget(QWidget):
         self.plot_widget.addItem(self.vLine, ignoreBounds=True)
         self.plot_widget.addItem(self.hLine, ignoreBounds=True)
         
+        # Filtre cutoff çizgileri (başlangıçta gizli)
+        self.filter_low_line = pg.InfiniteLine(
+            angle=90, movable=False, 
+            pen=pg.mkPen('#FF6B6B', width=2, style=Qt.DashLine),
+            label='HP', labelOpts={'color': '#FF6B6B', 'position': 0.95}
+        )
+        self.filter_high_line = pg.InfiniteLine(
+            angle=90, movable=False, 
+            pen=pg.mkPen('#FF6B6B', width=2, style=Qt.DashLine),
+            label='LP', labelOpts={'color': '#FF6B6B', 'position': 0.95}
+        )
+        self.filter_low_line.setVisible(False)
+        self.filter_high_line.setVisible(False)
+        self.plot_widget.addItem(self.filter_low_line, ignoreBounds=True)
+        self.plot_widget.addItem(self.filter_high_line, ignoreBounds=True)
+        
         # Mouse hareket takibi
         self.proxy = pg.SignalProxy(self.plot_widget.scene().sigMouseMoved, rateLimit=60, slot=self._mouseMoved)
         
@@ -443,6 +459,34 @@ class WaveformWidget(QWidget):
         self.peak_data = None
         self.current_freqs = None
         self.current_fft_db = None
+    
+    def set_filter_cutoffs(self, low_freq: float = None, high_freq: float = None, visible: bool = True):
+        """
+        Filtre cutoff çizgilerini ayarla ve göster
+        
+        Args:
+            low_freq: Düşük kesim frekansı (Hz) - None ise çizgiyi gizle
+            high_freq: Yüksek kesim frekansı (Hz) - None ise çizgiyi gizle
+            visible: Çizgilerin görünür olup olmayacağı
+        """
+        try:
+            # Düşük frekans (Highpass) çizgisi
+            if low_freq is not None and visible:
+                # Logaritmik eksende pozisyon
+                self.filter_low_line.setPos(low_freq)
+                self.filter_low_line.setVisible(True)
+            else:
+                self.filter_low_line.setVisible(False)
+            
+            # Yüksek frekans (Lowpass) çizgisi
+            if high_freq is not None and visible:
+                self.filter_high_line.setPos(high_freq)
+                self.filter_high_line.setVisible(True)
+            else:
+                self.filter_high_line.setVisible(False)
+                
+        except Exception as e:
+            logger.warning(f"Filter cutoff line update error: {e}")
 
 
 # =============================================================================

@@ -4,10 +4,13 @@
   
   Physical Layout: 132mm x 132mm, 42mm spacing, 4x4 grid
   Coordinate System (Camera View - looking at camera):
-    - Origin: Center (camera position)
+    - Origin: Center of microphone array
     - +X: Right (from camera's perspective)
     - +Y: Up
-    - +Z: Into scene (away from camera)
+    - +Z: Into scene (away from camera/array)
+  
+  Camera Position: (0, 0, 0) - Camera lens is at the center of the array
+  Camera FOV: 100 degrees (horizontal)
   
   Microphone Layout (Camera View - LEFT to RIGHT):
   
