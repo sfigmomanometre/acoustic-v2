@@ -84,6 +84,52 @@ import sounddevice as sd
 logger = logging.getLogger(__name__)
 
 
+class BirdNETWorker(QThread):
+    """BirdNET analizini arka planda çalıştıran QThread."""
+
+    resultsReady = Signal(list)   # list[dict] — tespit listesi
+    errorOccurred = Signal(str)   # hata mesajı
+
+    def __init__(self, audio_np: np.ndarray, sample_rate: int = 48000,
+                 min_confidence: float = 0.1):
+        super().__init__()
+        self._audio = audio_np
+        self._sr = sample_rate
+        self._min_conf = min_confidence
+
+    def run(self):
+        try:
+            import os, sys
+            from pathlib import Path
+            os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+
+            # Proje venv'ini sys.path'e ekle (GUI farklı Python ile açılmış olsa bile)
+            project_root = Path(__file__).resolve().parent.parent.parent
+            for site_pkg in (project_root / ".venv" / "lib").glob("python*/site-packages"):
+                if str(site_pkg) not in sys.path:
+                    sys.path.insert(0, str(site_pkg))
+            # src/ dizinini de ekle
+            src_dir = project_root / "src"
+            if str(src_dir) not in sys.path:
+                sys.path.insert(0, str(src_dir))
+
+            from classification.birdnet import BirdNETClassifier
+            clf = BirdNETClassifier(min_confidence=self._min_conf)
+            detections = clf.classify_audio(
+                self._audio,
+                sample_rate=self._sr,
+                channel=0,
+            )
+            self.resultsReady.emit(detections)
+        except ModuleNotFoundError as exc:
+            self.errorOccurred.emit(
+                f"Modül bulunamadı: {exc}. "
+                "Venv aktif mi? (.venv/bin/python ile çalıştırın)"
+            )
+        except Exception as exc:
+            self.errorOccurred.emit(str(exc))
+
+
 class AcousticCameraGUI(QMainWindow):
     """Ana GUI sınıfı"""
     
@@ -143,6 +189,16 @@ class AcousticCameraGUI(QMainWindow):
         
         # Performance monitoring
         self.beamforming_times = []  # Track processing times
+
+        # BirdNET
+        self.birdnet_enabled = False
+        self.birdnet_worker: Optional[BirdNETWorker] = None
+        self.birdnet_timer = QTimer()
+        self.birdnet_timer.timeout.connect(self._trigger_birdnet_analysis)
+        self.birdnet_interval_s = 3  # her 3 saniyede bir analiz
+        # Güven eşiği üzerindeki türler kalıcı olarak tutulur {tür_adı: max_güven}
+        self.birdnet_confirmed_birds: dict = {}
+        self.birdnet_confirm_threshold: float = 0.60
         
         # Recording variables
         self.video_writer = None
@@ -847,13 +903,170 @@ class AcousticCameraGUI(QMainWindow):
         
         # Kaynak widget'ları için liste
         self.source_widgets = []
-        
+
+        # BirdNET Paneli
+        birdnet_group = self._create_birdnet_group()
+        layout.addWidget(birdnet_group)
+
         # VU Meters (en altta)
         vu_meter_group = self._create_vu_meter_group()
         layout.addWidget(vu_meter_group)
-        
+
         return panel
     
+    def _create_birdnet_group(self) -> QGroupBox:
+        """BirdNET kuş tespiti paneli."""
+        _list_style = """
+            QListWidget {
+                background-color: #1e1e1e;
+                border: 1px solid #444;
+                font-size: 11px;
+            }
+            QListWidget::item { padding: 2px 4px; }
+            QListWidget::item:selected { background-color: #2a5ea8; }
+        """
+
+        group = QGroupBox("BirdNET — Kuş Tespiti")
+        layout = QVBoxLayout()
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
+
+        # Aç/kapat + durum
+        top_row = QHBoxLayout()
+        self.birdnet_enable_cb = QCheckBox("Aktif")
+        self.birdnet_enable_cb.setChecked(False)
+        self.birdnet_enable_cb.toggled.connect(self._on_birdnet_toggle)
+        top_row.addWidget(self.birdnet_enable_cb)
+        top_row.addStretch()
+        self.birdnet_status_label = QLabel("Devre dışı")
+        self.birdnet_status_label.setStyleSheet("color: #888; font-size: 10px;")
+        top_row.addWidget(self.birdnet_status_label)
+        layout.addLayout(top_row)
+
+        # --- Anlık Tespit (3s pencere, tüm güven seviyeleri) ---
+        layout.addWidget(QLabel("Anlık Tespit:"))
+        self.birdnet_realtime_list = QListWidget()
+        self.birdnet_realtime_list.setMaximumHeight(90)
+        self.birdnet_realtime_list.setStyleSheet(_list_style)
+        layout.addWidget(self.birdnet_realtime_list)
+
+        # --- Tespit Edilen Kuşlar (kalıcı) ---
+        confirmed_header = QHBoxLayout()
+        confirmed_header.addWidget(QLabel("Tespit Edilen Kuşlar:"))
+        confirmed_header.addStretch()
+        clear_btn = QPushButton("Temizle")
+        clear_btn.setFixedHeight(18)
+        clear_btn.setFixedWidth(55)
+        clear_btn.setStyleSheet("font-size: 10px;")
+        clear_btn.clicked.connect(self._clear_confirmed_birds)
+        confirmed_header.addWidget(clear_btn)
+        layout.addLayout(confirmed_header)
+
+        # Eşik değeri girişi
+        threshold_row = QHBoxLayout()
+        threshold_row.addWidget(QLabel("Min. Güven Eşiği:"))
+        self.birdnet_threshold_spin = QDoubleSpinBox()
+        self.birdnet_threshold_spin.setRange(0.01, 1.0)
+        self.birdnet_threshold_spin.setDecimals(2)
+        self.birdnet_threshold_spin.setSingleStep(0.05)
+        self.birdnet_threshold_spin.setValue(0.60)
+        self.birdnet_threshold_spin.setFixedWidth(60)
+        self.birdnet_threshold_spin.valueChanged.connect(
+            lambda v: setattr(self, 'birdnet_confirm_threshold', v)
+        )
+        threshold_row.addWidget(self.birdnet_threshold_spin)
+        threshold_row.addStretch()
+        layout.addLayout(threshold_row)
+
+        self.birdnet_confirmed_list = QListWidget()
+        self.birdnet_confirmed_list.setMaximumHeight(110)
+        self.birdnet_confirmed_list.setStyleSheet(_list_style)
+        layout.addWidget(self.birdnet_confirmed_list)
+
+        group.setLayout(layout)
+        return group
+
+    def _on_birdnet_toggle(self, enabled: bool):
+        self.birdnet_enabled = enabled
+        if enabled:
+            self.birdnet_status_label.setText("●")
+            self.birdnet_status_label.setStyleSheet("color: #4caf50; font-size: 10px;")
+            if self.is_running:
+                self.birdnet_timer.start(self.birdnet_interval_s * 1000)
+                self._trigger_birdnet_analysis()   # ilk analizi hemen başlat
+        else:
+            self.birdnet_timer.stop()
+            self.birdnet_status_label.setText("Devre dışı")
+            self.birdnet_status_label.setStyleSheet("color: #888; font-size: 10px;")
+
+    def _trigger_birdnet_analysis(self):
+        """Anlık BirdNET analizini arka planda başlat."""
+        if self.audio_thread is None:
+            return
+        if self.birdnet_worker is not None and self.birdnet_worker.isRunning():
+            return  # Önceki analiz hâlâ sürüyor
+
+        audio_data = self.audio_thread.get_buffer_data(duration=3.0)
+        if audio_data is None or len(audio_data) == 0:
+            return
+
+        self.birdnet_worker = BirdNETWorker(
+            audio_np=audio_data,
+            sample_rate=48000,
+            min_confidence=0.1,
+        )
+        self.birdnet_worker.resultsReady.connect(self._on_birdnet_results)
+        self.birdnet_worker.errorOccurred.connect(self._on_birdnet_error)
+        self.birdnet_worker.start()
+
+    def _on_birdnet_results(self, detections: list):
+        """BirdNET analiz sonuçlarını her iki listeye yaz."""
+        now = datetime.now().strftime("%H:%M:%S")
+
+        # Tür başına en yüksek güveni al
+        best: dict[str, float] = {}
+        for d in detections:
+            name = d["common_name"]
+            best[name] = max(best.get(name, 0.0), d["confidence"])
+
+        # 1) Anlık tespit listesi — tüm türler, her 3s'de yenilenir
+        self.birdnet_realtime_list.clear()
+        if best:
+            for name, conf in sorted(best.items(), key=lambda x: x[1], reverse=True):
+                bar = "▉" * int(conf * 10)
+                self.birdnet_realtime_list.addItem(f"{name}  {conf:.2f}  {bar}")
+        else:
+            self.birdnet_realtime_list.addItem("—")
+
+        # 2) Kalıcı liste — eşik üzerindekiler eklenir, hiç silinmez
+        updated = False
+        for name, conf in best.items():
+            if conf >= self.birdnet_confirm_threshold:
+                if name not in self.birdnet_confirmed_birds or conf > self.birdnet_confirmed_birds[name]:
+                    self.birdnet_confirmed_birds[name] = conf
+                    updated = True
+
+        if updated:
+            self.birdnet_confirmed_list.clear()
+            for name, conf in sorted(self.birdnet_confirmed_birds.items(),
+                                     key=lambda x: x[1], reverse=True):
+                bar = "▉" * int(conf * 10)
+                self.birdnet_confirmed_list.addItem(f"{name}  {conf:.2f}  {bar}")
+
+        # Durum güncelle
+        self.birdnet_status_label.setText(f"● {now}")
+        self.birdnet_status_label.setStyleSheet("color: #4caf50; font-size: 10px;")
+
+    def _clear_confirmed_birds(self):
+        """Kalıcı kuş listesini sıfırla."""
+        self.birdnet_confirmed_birds.clear()
+        self.birdnet_confirmed_list.clear()
+
+    def _on_birdnet_error(self, error_msg: str):
+        self.birdnet_status_label.setText(f"! {error_msg[:40]}")
+        self.birdnet_status_label.setStyleSheet("color: #f44336; font-size: 10px;")
+        logger.error(f"BirdNET hatası: {error_msg}")
+
     def _create_vu_meter_group(self) -> QGroupBox:
         """VU meter göstergeleri - 4x4 grid (UMA-16v2 fiziksel geometrisine uygun)"""
         group = QGroupBox("Mikrofon Array (16 Ch)")
@@ -1358,7 +1571,11 @@ class AcousticCameraGUI(QMainWindow):
         
         # Timer başlat
         self.update_timer.start(33)  # ~30 FPS
-        
+
+        # BirdNET timer — sadece aktifse başlat
+        if self.birdnet_enabled:
+            self.birdnet_timer.start(self.birdnet_interval_s * 1000)
+
         self.statusbar.showMessage("Sistem çalışıyor")
         
     def stop_system(self):
@@ -1372,7 +1589,12 @@ class AcousticCameraGUI(QMainWindow):
         
         # Timer durdur
         self.update_timer.stop()
-        
+        self.birdnet_timer.stop()
+
+        # BirdNET worker'ı durdur
+        if self.birdnet_worker is not None and self.birdnet_worker.isRunning():
+            self.birdnet_worker.wait(3000)
+
         # Audio stream'i durdur
         self._stop_audio_stream()
         

@@ -38,3 +38,9 @@ pytest-cov>=3.0.0
 # Optional: GUI (sonradan eklenecek)
 # PyQt5>=5.15.0
 # pyqtgraph>=0.12.0
+
+# Bird Classification (BirdNET)
+birdnetlib>=0.18.0
+librosa>=0.10.0
+ai_edge_litert>=2.1.0   # TFLite runtime — Python 3.12 macOS uyumlu (tensorflow yerine)
+tensorflow>=2.15.0       # Fallback (ai_edge_litert yoksa)
