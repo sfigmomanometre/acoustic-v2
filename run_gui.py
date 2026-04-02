@@ -4,8 +4,12 @@ UMA-16 Akustik Kamera GUI Başlatıcı
 """
 
 import sys
+import os
 import logging
 from pathlib import Path
+
+# macOS: OpenGL widget'larının Qt layer içinde render edilmesi için
+os.environ.setdefault('QT_MAC_WANTS_LAYER', '1')
 
 # Proje kök dizinini path'e ekle
 project_root = Path(__file__).parent

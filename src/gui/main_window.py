@@ -23,11 +23,15 @@ Layout:
 """
 
 import sys
+import os
 import logging
 import time
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
+
+# macOS: OpenGL widget'larının Qt layer içinde render edilmesi için
+os.environ.setdefault('QT_MAC_WANTS_LAYER', '1')
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
@@ -196,7 +200,8 @@ class AcousticCameraGUI(QMainWindow):
         self.birdnet_timer = QTimer()
         self.birdnet_timer.timeout.connect(self._trigger_birdnet_analysis)
         self.birdnet_interval_s = 3  # her 3 saniyede bir analiz
-        # Güven eşiği üzerindeki türler kalıcı olarak tutulur {tür_adı: max_güven}
+        # Güven eşiği üzerindeki türler kalıcı olarak tutulur
+        # {tür_adı: {'conf': float, 'first_seen': datetime, 'last_seen': datetime}}
         self.birdnet_confirmed_birds: dict = {}
         self.birdnet_confirm_threshold: float = 0.60
         
@@ -926,7 +931,7 @@ class AcousticCameraGUI(QMainWindow):
             QListWidget::item:selected { background-color: #2a5ea8; }
         """
 
-        group = QGroupBox("BirdNET — Kuş Tespiti")
+        group = QGroupBox("Kuş Tespiti")
         layout = QVBoxLayout()
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(4)
@@ -978,10 +983,27 @@ class AcousticCameraGUI(QMainWindow):
         threshold_row.addStretch()
         layout.addLayout(threshold_row)
 
-        self.birdnet_confirmed_list = QListWidget()
-        self.birdnet_confirmed_list.setMaximumHeight(110)
-        self.birdnet_confirmed_list.setStyleSheet(_list_style)
-        layout.addWidget(self.birdnet_confirmed_list)
+        # Tespit edilen kuşlar — her satırda × butonu olan scroll alanı
+        self.birdnet_confirmed_scroll = QScrollArea()
+        self.birdnet_confirmed_scroll.setWidgetResizable(True)
+        self.birdnet_confirmed_scroll.setMaximumHeight(130)
+        self.birdnet_confirmed_scroll.setStyleSheet(
+            "QScrollArea { border: 1px solid #444; background: #1e1e1e; }"
+        )
+        self.birdnet_confirmed_container = QWidget()
+        self.birdnet_confirmed_container.setStyleSheet("background: #1e1e1e;")
+        self.birdnet_confirmed_layout = QVBoxLayout(self.birdnet_confirmed_container)
+        self.birdnet_confirmed_layout.setContentsMargins(4, 2, 4, 2)
+        self.birdnet_confirmed_layout.setSpacing(1)
+        self.birdnet_confirmed_layout.addStretch()
+        self.birdnet_confirmed_scroll.setWidget(self.birdnet_confirmed_container)
+        layout.addWidget(self.birdnet_confirmed_scroll)
+
+        # Kaydet butonu
+        save_btn = QPushButton("Tespit Edilen Kuşları Kaydet")
+        save_btn.setFixedHeight(24)
+        save_btn.clicked.connect(self._save_confirmed_birds)
+        layout.addWidget(save_btn)
 
         group.setLayout(layout)
         return group
@@ -1038,29 +1060,109 @@ class AcousticCameraGUI(QMainWindow):
         else:
             self.birdnet_realtime_list.addItem("—")
 
-        # 2) Kalıcı liste — eşik üzerindekiler eklenir, hiç silinmez
-        updated = False
+        # 2) Kalıcı liste — eşik üzerindekiler eklenir, × ile silinebilir
+        ts = datetime.now()
         for name, conf in best.items():
             if conf >= self.birdnet_confirm_threshold:
-                if name not in self.birdnet_confirmed_birds or conf > self.birdnet_confirmed_birds[name]:
-                    self.birdnet_confirmed_birds[name] = conf
-                    updated = True
-
-        if updated:
-            self.birdnet_confirmed_list.clear()
-            for name, conf in sorted(self.birdnet_confirmed_birds.items(),
-                                     key=lambda x: x[1], reverse=True):
-                bar = "▉" * int(conf * 10)
-                self.birdnet_confirmed_list.addItem(f"{name}  {conf:.2f}  {bar}")
+                if name not in self.birdnet_confirmed_birds:
+                    self.birdnet_confirmed_birds[name] = {
+                        'conf': conf, 'first_seen': ts, 'last_seen': ts
+                    }
+                    self._add_confirmed_bird_row(name, conf, ts)
+                elif conf > self.birdnet_confirmed_birds[name]['conf']:
+                    self.birdnet_confirmed_birds[name]['conf'] = conf
+                    self.birdnet_confirmed_birds[name]['last_seen'] = ts
+                    self._rebuild_confirmed_list()
 
         # Durum güncelle
         self.birdnet_status_label.setText(f"● {now}")
         self.birdnet_status_label.setStyleSheet("color: #4caf50; font-size: 10px;")
 
+    def _add_confirmed_bird_row(self, name: str, conf: float, ts: datetime):
+        """Kalıcı listeye tek bir tür satırı ekle (× butonu ile)."""
+        row = QWidget()
+        row.setStyleSheet("background: transparent;")
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(4)
+
+        bar = "▉" * int(conf * 10)
+        label = QLabel(f"{name}  {conf:.2f}  {bar}")
+        label.setStyleSheet("color: #ddd; font-size: 11px;")
+        row_layout.addWidget(label)
+        row_layout.addStretch()
+
+        del_btn = QPushButton("×")
+        del_btn.setFixedSize(16, 16)
+        del_btn.setStyleSheet(
+            "QPushButton { color: #aaa; background: transparent; border: none; font-size: 12px; }"
+            "QPushButton:hover { color: #f44; }"
+        )
+        del_btn.clicked.connect(lambda _, n=name: self._remove_confirmed_bird(n))
+        row_layout.addWidget(del_btn)
+
+        # Stretch'ten önce ekle
+        idx = self.birdnet_confirmed_layout.count() - 1
+        self.birdnet_confirmed_layout.insertWidget(idx, row)
+
+    def _rebuild_confirmed_list(self):
+        """Tüm confirmed listesini sıfırdan oluştur (güven skoru güncellemelerinde)."""
+        while self.birdnet_confirmed_layout.count() > 1:
+            item = self.birdnet_confirmed_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        for name, data in sorted(self.birdnet_confirmed_birds.items(),
+                                 key=lambda x: x[1]['conf'], reverse=True):
+            self._add_confirmed_bird_row(name, data['conf'], data['first_seen'])
+
+    def _remove_confirmed_bird(self, name: str):
+        """Kalıcı listeden tek türü çıkar."""
+        if name in self.birdnet_confirmed_birds:
+            del self.birdnet_confirmed_birds[name]
+            self._rebuild_confirmed_list()
+
     def _clear_confirmed_birds(self):
-        """Kalıcı kuş listesini sıfırla."""
+        """Kalıcı kuş listesini tamamen sıfırla."""
         self.birdnet_confirmed_birds.clear()
-        self.birdnet_confirmed_list.clear()
+        while self.birdnet_confirmed_layout.count() > 1:
+            item = self.birdnet_confirmed_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+    def _save_confirmed_birds(self):
+        """Tespit edilen kuşları data/bird_detections/ altına txt olarak kaydet."""
+        if not self.birdnet_confirmed_birds:
+            QMessageBox.information(self, "Kaydet", "Kaydedilecek tespit bulunamadı.")
+            return
+
+        save_dir = Path(__file__).resolve().parent.parent.parent / "data" / "bird_detections"
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        now = datetime.now()
+        filename = save_dir / f"detections_{now.strftime('%Y%m%d_%H%M%S')}.txt"
+
+        lines = [
+            "Kuş Tespit Raporu",
+            f"Kayıt Tarihi : {now.strftime('%d %B %Y, %H:%M:%S')}",
+            f"Güven Eşiği  : {self.birdnet_confirm_threshold:.2f}",
+            "=" * 50,
+            "",
+        ]
+        for name, data in sorted(self.birdnet_confirmed_birds.items(),
+                                 key=lambda x: x[1]['conf'], reverse=True):
+            first = data['first_seen'].strftime('%H:%M:%S')
+            last  = data['last_seen'].strftime('%H:%M:%S')
+            lines.append(
+                f"{name:<35}  Güven: {data['conf']:.2f}"
+                f"  İlk: {first}  Son: {last}"
+            )
+
+        filename.write_text("\n".join(lines), encoding="utf-8")
+        QMessageBox.information(
+            self, "Kaydedildi",
+            f"{len(self.birdnet_confirmed_birds)} tür kaydedildi:\n{filename}"
+        )
+        logger.info(f"Kuş tespitleri kaydedildi: {filename}")
 
     def _on_birdnet_error(self, error_msg: str):
         self.birdnet_status_label.setText(f"! {error_msg[:40]}")
@@ -2665,15 +2767,22 @@ class AcousticCameraGUI(QMainWindow):
         from scipy.ndimage import maximum_filter, label
         
         try:
-            # Get dB threshold
-            db_min, db_max = self.db_range_slider.values()
-            threshold = db_min + (db_max - db_min) * 0.2  # 20% above min
-            
+            # Data-adaptive threshold: top 30% of the actual power range
+            data_p5  = float(np.percentile(power_grid, 5))
+            data_p99 = float(np.percentile(power_grid, 99))
+            contrast_db = data_p99 - data_p5
+
+            # Kontrast çok düşükse (gürültü) peak döndürme
+            if contrast_db < 1.5:
+                return []
+
+            threshold = data_p5 + (data_p99 - data_p5) * 0.70  # top 30% visible
+
             # Find local maxima using maximum filter
             # A point is a local maximum if it equals the maximum in its neighborhood
             neighborhood_size = 5  # Size of neighborhood for local max detection
             local_max = maximum_filter(power_grid, size=neighborhood_size)
-            
+
             # Detect peaks: points that are local maxima and above threshold
             peak_mask = (power_grid == local_max) & (power_grid > threshold)
             
@@ -2746,86 +2855,65 @@ class AcousticCameraGUI(QMainWindow):
         Returns:
             heatmap: (height, width, 4) BGRA uint8 image (with alpha channel)
         """
-        # Get dB range from GUI - use these as reference thresholds
-        db_min_ui, db_max_ui = self.db_range_slider.values()
-        
-        # Calculate the actual data range
-        data_min = np.min(power_grid)
-        data_max = np.max(power_grid)
-        
-        # Use the UI slider values as the normalization range
-        # Clip power values to the UI range
-        power_clipped = np.clip(power_grid, db_min_ui, db_max_ui)
-        
-        # Normalize to [0, 1] using UI slider range
-        db_range = db_max_ui - db_min_ui
-        if db_range < 1e-6:
-            db_range = 1.0
-        normalized = (power_clipped - db_min_ui) / db_range
-        normalized = np.clip(normalized, 0, 1)
-        
-        # Apply gaussian smoothing for nicer visual
-        normalized_smooth = gaussian_filter(normalized, sigma=1.5)
-        
+        # ------------------------------------------------------------------
+        # Normalization: p5 → p99 of actual data (absolute dB'den bağımsız)
+        # ------------------------------------------------------------------
+        data_p5  = float(np.percentile(power_grid, 5))
+        data_p99 = float(np.percentile(power_grid, 99))
+        data_range = data_p99 - data_p5
+        if data_range < 1e-6:
+            data_range = 1.0
+        normalized = np.clip((power_grid - data_p5) / data_range, 0.0, 1.0)
+
+        # ------------------------------------------------------------------
+        # Confidence factor: haritanın gerçek kontrast miktarına göre
+        # overlay yoğunluğu ölçeklenir.
+        #   • contrast < 1.5 dB  → gürültü → overlay neredeyse görünmez
+        #   • contrast > 7   dB  → güçlü kaynak → overlay tam görünür
+        # ------------------------------------------------------------------
+        contrast_db  = data_p99 - data_p5
+        min_contrast = 1.5
+        max_contrast = 7.0
+        confidence = float(np.clip(
+            (contrast_db - min_contrast) / (max_contrast - min_contrast), 0.0, 1.0
+        ))
+
+        # Gaussian smoothing
+        normalized_smooth = gaussian_filter(normalized, sigma=2.0)
+        normalized_smooth = np.clip(normalized_smooth, 0.0, 1.0)
+
         # Convert to [0, 255] uint8 for colormap
-        # HIGH values (loud) should be RED, LOW values (quiet) should be BLUE
         normalized_uint8 = (normalized_smooth * 255).astype(np.uint8)
-        
+
         # Get colormap from GUI
         colormap_name = self.colormap_combo.currentText()
-        
-        # Apply colormap - JET goes from BLUE (0) to RED (255)
-        # So high power → 255 → RED, low power → 0 → BLUE ✓
         colormap_dict = {
-            'jet': cv2.COLORMAP_JET,
-            'hot': cv2.COLORMAP_HOT,
-            'viridis': cv2.COLORMAP_VIRIDIS,
-            'plasma': cv2.COLORMAP_PLASMA,
-            'inferno': cv2.COLORMAP_INFERNO,
+            'jet':      cv2.COLORMAP_JET,
+            'hot':      cv2.COLORMAP_HOT,
+            'viridis':  cv2.COLORMAP_VIRIDIS,
+            'plasma':   cv2.COLORMAP_PLASMA,
+            'inferno':  cv2.COLORMAP_INFERNO,
             'coolwarm': cv2.COLORMAP_COOL,
-            'rainbow': cv2.COLORMAP_RAINBOW,
-            'turbo': cv2.COLORMAP_TURBO
+            'rainbow':  cv2.COLORMAP_RAINBOW,
+            'turbo':    cv2.COLORMAP_TURBO,
         }
-        
         cv_colormap = colormap_dict.get(colormap_name, cv2.COLORMAP_JET)
         heatmap_bgr = cv2.applyColorMap(normalized_uint8, cv_colormap)
-        
-        # ============================================================
-        # Alpha channel: ONLY show where there's significant sound
-        # Low power areas should be FULLY TRANSPARENT
-        # High power areas should be visible
-        # ============================================================
-        
-        # Use percentile-based threshold to only show top power regions
-        # This ensures only actual sound sources are visible
-        percentile_threshold = 75  # Only show top 25% of power values
-        threshold_value = np.percentile(normalized_smooth, percentile_threshold)
-        
-        # Ensure minimum threshold (at least 0.5 normalized)
-        alpha_threshold = max(threshold_value, 0.5)
-        
-        # Create alpha channel
-        alpha = np.zeros_like(normalized_smooth, dtype=np.float32)
-        
-        # Only where power is above threshold
-        above_threshold = normalized_smooth > alpha_threshold
-        
-        # Scale alpha: threshold→0, 1.0→1.0
-        if np.any(above_threshold):
-            max_val = np.max(normalized_smooth)
-            if max_val > alpha_threshold:
-                alpha[above_threshold] = (normalized_smooth[above_threshold] - alpha_threshold) / (max_val - alpha_threshold)
-        
-        # Apply power curve to make high values more prominent
-        alpha = np.power(alpha, 0.7)
-        
-        # Clamp and convert to uint8
-        alpha = np.clip(alpha, 0, 1)
+
+        # ------------------------------------------------------------------
+        # Alpha channel
+        #   • gamma=2.0 → düşük değerler hızla şeffaflaşır, peak öne çıkar
+        #   • confidence → sinyal yoksa tüm overlay solar
+        #   • max 0.85   → kamera her zaman altından görünür
+        # ------------------------------------------------------------------
+        alpha = np.power(normalized_smooth, 2.0).astype(np.float32)
+        alpha = np.clip(alpha * confidence * 0.85, 0.0, 0.85)
+
         alpha_uint8 = (alpha * 255).astype(np.uint8)
-        
+
         # Add alpha channel (BGR + Alpha = BGRA)
         heatmap_bgra = np.dstack([heatmap_bgr, alpha_uint8])
-        
+
         return heatmap_bgra
     
     def _draw_corner_brackets(self, frame, cx, cy, size, color, thickness=2, gap=8):
