@@ -1286,8 +1286,234 @@ def normalize_power_map(
     # Clip and normalize
     power_clipped = np.clip(power_db, vmin, vmax)
     normalized = (power_clipped - vmin) / (vmax - vmin + 1e-6)
-    
+
     return normalized
+
+
+# ============================================================================
+# Hybrid Beamforming Pipeline: DAS → ROI → MUSIC
+# ============================================================================
+
+def estimate_source_count(
+    csm_stack: np.ndarray,
+    max_sources: int = 4,
+    method: str = 'mdl',
+) -> int:
+    """
+    Estimate number of acoustic sources from a CSM stack.
+
+    Two methods are available:
+
+    ``'mdl'`` — Minimum Description Length criterion (Wax & Kailath, 1985).
+        Information-theoretic: minimises a penalised log-likelihood over all
+        candidate source counts k = 0 … n_mics-1.  Well-established in the
+        array processing literature and directly citable in papers.
+
+    ``'gap'`` — Eigenvalue gap (elbow) analysis.
+        Finds the k where the ratio λ[k] / λ[k+1] is maximised.  Fast,
+        intuitive, robust when MDL over-estimates in reverberant environments.
+
+    The two estimates are combined by taking their minimum, which strongly
+    suppresses over-counting caused by room reflections or correlated noise
+    in real recordings.
+
+    Args:
+        csm_stack: (n_freqs, n_mics, n_mics) Cross-Spectral Matrix stack.
+        max_sources: Hard upper bound on the returned estimate (default 4).
+        method: ``'mdl'``, ``'gap'``, or ``'both'`` (intersection).
+
+    Returns:
+        n_sources: Estimated number of sources (≥ 1).
+    """
+    # Average CSM across frequency bins → (n_mics, n_mics)
+    R_avg = np.mean(csm_stack, axis=0)
+
+    # Eigendecompose — eigvalsh returns ascending order for Hermitian matrices
+    eigenvalues = np.real(np.linalg.eigvalsh(R_avg))[::-1]   # descending
+    eigenvalues = np.maximum(eigenvalues, 1e-30)              # avoid log(0)
+    n_mics = len(eigenvalues)
+
+    # ── MDL (Wax & Kailath, 1985) ────────────────────────────────────────
+    def _mdl(k: int) -> float:
+        """MDL cost for k signal sources."""
+        noise_eigs = eigenvalues[k:]
+        if len(noise_eigs) == 0:
+            return np.inf
+        n_noise = n_mics - k
+        # Geometric mean / arithmetic mean of noise eigenvalues
+        log_geom = np.mean(np.log(noise_eigs))
+        arith    = np.mean(noise_eigs)
+        if arith < 1e-30:
+            return np.inf
+        log_likelihood = -n_noise * (log_geom - np.log(arith))
+        # Penalty term (number of free parameters)
+        penalty = 0.5 * k * (2 * n_mics - k) * np.log(n_mics)
+        return log_likelihood + penalty
+
+    mdl_costs = [_mdl(k) for k in range(max_sources + 1)]
+    n_mdl = int(np.argmin(mdl_costs))
+
+    # ── Eigenvalue Gap ────────────────────────────────────────────────────
+    # Find the largest drop ratio between consecutive eigenvalues
+    ratios = eigenvalues[:-1] / (eigenvalues[1:] + 1e-30)
+    # Only consider gaps up to max_sources
+    ratios_limited = ratios[:max_sources]
+    n_gap = int(np.argmax(ratios_limited)) + 1  # +1: gap after index k → k+1 sources
+
+    # ── Combine ───────────────────────────────────────────────────────────
+    if method == 'mdl':
+        n_sources = n_mdl
+    elif method == 'gap':
+        n_sources = n_gap
+    else:  # 'both' — intersection suppresses over-counting
+        n_sources = min(n_mdl, n_gap)
+
+    n_sources = max(1, min(n_sources, max_sources, n_mics - 1))
+
+    logger.debug(
+        f"Source count — MDL: {n_mdl}, Gap: {n_gap}, used: {n_sources} "
+        f"(method={method})"
+    )
+    return n_sources
+
+
+def detect_roi(
+    power_map: np.ndarray,
+    threshold_db: float = -12.0,
+    min_points: int = 9,
+) -> np.ndarray:
+    """
+    Detect Region of Interest (ROI) in a power map.
+
+    Returns a boolean mask selecting grid points whose power is within
+    |threshold_db| dB of the global maximum.
+
+    Args:
+        power_map: (n_points,) linear power map (output of DAS).
+        threshold_db: Negative value; points within this many dB of peak are ROI.
+        min_points: Minimum ROI size to guarantee meaningful MUSIC input.
+
+    Returns:
+        roi_mask: (n_points,) boolean array, True = inside ROI.
+    """
+    power_db = power_to_db(power_map)
+    max_db = float(np.max(power_db))
+
+    roi_mask = power_db >= (max_db + threshold_db)
+
+    # Guarantee minimum size
+    if roi_mask.sum() < min_points:
+        top_idx = np.argsort(power_map)[::-1][:min_points]
+        roi_mask = np.zeros(len(power_map), dtype=bool)
+        roi_mask[top_idx] = True
+
+    return roi_mask
+
+
+def hybrid_beamformer_realtime(
+    mic_signals: np.ndarray,
+    mic_positions: np.ndarray,
+    grid_points: np.ndarray,
+    sample_rate: float,
+    config: BeamformingConfig,
+    freq_range: Optional[Tuple[float, float]] = None,
+    max_freq_bins: int = 10,
+    distances: Optional[np.ndarray] = None,
+    roi_threshold_db: float = -12.0,
+    auto_sources: bool = True,
+    n_sources: int = 1,
+    source_count_method: str = 'gap',
+    diagonal_loading: float = 1e-6,
+) -> Tuple[np.ndarray, int, np.ndarray]:
+    """
+    Two-stage Hybrid Beamformer: DAS → ROI Detection → MUSIC (on ROI only).
+
+    Stage 1 — DAS scans the full grid quickly to produce a coarse energy map.
+    ROI Detection — selects grid points within roi_threshold_db of the peak.
+    Source Estimation — eigenvalue analysis of the CSM to count active sources.
+    Stage 2 — MUSIC runs only inside the ROI with the estimated source count,
+               achieving high spatial resolution at a fraction of the cost.
+
+    Non-ROI points are filled with a scaled DAS background so the heatmap
+    retains context information.
+
+    Args:
+        mic_signals: (n_samples, n_mics) microphone signals.
+        mic_positions: (n_mics, 3) microphone positions.
+        grid_points: (n_points, 3) focus grid points.
+        sample_rate: Sampling rate in Hz.
+        config: BeamformingConfig instance.
+        freq_range: (f_min, f_max) override; uses config if None.
+        max_freq_bins: Frequency subsampling limit (speed vs accuracy).
+        distances: Precomputed (n_points, n_mics) distances; computed if None.
+        roi_threshold_db: DAS energy drop (dB) that defines ROI boundary (negative).
+        auto_sources: If True, estimate source count from eigenvalues; else use n_sources.
+        n_sources: Manual source count (used when auto_sources=False).
+        diagonal_loading: CSM regularisation term.
+
+    Returns:
+        full_power: (n_points,) merged power map (MUSIC inside ROI, DAS outside).
+        n_sources_used: Source count actually passed to MUSIC.
+        roi_mask: (n_points,) boolean ROI mask.
+    """
+    f_min = freq_range[0] if freq_range is not None else config.freq_min
+    f_max = freq_range[1] if freq_range is not None else config.freq_max
+
+    # Precompute distances once — shared between Stage 1 and Stage 2
+    if distances is None and config.field_type == 'near-field':
+        distances = _precompute_distances(mic_positions, grid_points)
+
+    # ------------------------------------------------------------------
+    # Stage 1: DAS — full grid, fast
+    # ------------------------------------------------------------------
+    das_power = das_beamformer_realtime(
+        mic_signals, mic_positions, grid_points, sample_rate, config,
+        freq_range=freq_range, max_freq_bins=max_freq_bins, distances=distances,
+    )
+
+    # ------------------------------------------------------------------
+    # ROI Detection
+    # ------------------------------------------------------------------
+    roi_mask = detect_roi(das_power, threshold_db=roi_threshold_db)
+    roi_grid_points = grid_points[roi_mask]
+    roi_distances = distances[roi_mask] if distances is not None else None
+
+    logger.debug(f"Hybrid ROI: {roi_mask.sum()} / {len(grid_points)} points "
+                 f"({100 * roi_mask.mean():.1f}%)")
+
+    # ------------------------------------------------------------------
+    # Source Count Estimation
+    # ------------------------------------------------------------------
+    n_sources_used = n_sources
+    if auto_sources:
+        try:
+            csm, _, _ = compute_covariance_matrix(
+                mic_signals, sample_rate, (f_min, f_max), diagonal_loading
+            )
+            n_sources_used = estimate_source_count(csm, method=source_count_method)
+        except Exception as exc:
+            logger.warning(f"Source count estimation failed: {exc}; using {n_sources}")
+
+    # ------------------------------------------------------------------
+    # Stage 2: MUSIC — ROI grid points only
+    # ------------------------------------------------------------------
+    roi_power = music_beamformer_realtime(
+        mic_signals, mic_positions, roi_grid_points, sample_rate, config,
+        freq_range=freq_range, n_sources=n_sources_used,
+        diagonal_loading=diagonal_loading, max_freq_bins=max_freq_bins,
+        distances=roi_distances,
+    )
+
+    # ------------------------------------------------------------------
+    # Merge: MUSIC inside ROI, scaled DAS as background context
+    # ------------------------------------------------------------------
+    das_norm = das_power / (das_power.max() + 1e-30)
+    music_peak = float(roi_power.max()) if roi_power.max() > 0 else 1.0
+
+    full_power = das_norm * (music_peak * 0.05)   # DAS as faint background
+    full_power[roi_mask] = roi_power
+
+    return full_power, n_sources_used, roi_mask
 
 
 # ============================================================================

@@ -5,7 +5,7 @@ Real-time audio visualization için pyqtgraph tabanlı widget'lar
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QLinearGradient, QColor, QBrush
 from scipy import signal
@@ -536,7 +536,29 @@ class Spatial3DWidget(QWidget):
         # Create 3D view
         self.view = gl.GLViewWidget()
         self.view.setBackgroundColor('#0a0a14')
-        self.view.setCameraPosition(distance=1.5, elevation=30, azimuth=45)
+
+        # Başlangıç kamera: mic dizisinin ARKASINDA (−Z tarafı), +Z yönüne bakıyor.
+        # elevation = −82 → kamera z ≈ −1.6 m (dizi gerisinde)
+        # azimuth  =   0 → X dünya ekseni = ekranın solu-sağı (sol=sol ✓)
+        # Böylece gerçek dünyadaki sol/sağ ses kaynakları ekranda da sol/sağda görünür.
+        self._default_camera = dict(
+            pos=pg.Vector(0, 0, 0.5),   # görüş merkezi: array ile kaynak ortası
+            distance=2.5,
+            elevation=-82,
+            azimuth=0,
+        )
+        self._reset_camera()
+
+        # "Görünümü Sıfırla" butonu
+        reset_btn = QPushButton("↺ Görünümü Sıfırla")
+        reset_btn.setFixedHeight(22)
+        reset_btn.setStyleSheet(
+            "QPushButton { background: #1e1e2e; color: #aaa; border: 1px solid #444;"
+            " border-radius: 3px; font-size: 10px; }"
+            "QPushButton:hover { background: #2e2e4e; color: #fff; }"
+        )
+        reset_btn.clicked.connect(self._reset_camera)
+        layout.addWidget(reset_btn)
         layout.addWidget(self.view)
         
         # Add grid floor
@@ -549,6 +571,18 @@ class Spatial3DWidget(QWidget):
         self.source_items = []
         self.laser_items = []
     
+    def _reset_camera(self):
+        """Kamerayı mic arkasından bakan varsayılan konuma döndür."""
+        if not OPENGL_AVAILABLE or not hasattr(self, 'view'):
+            return
+        c = self._default_camera
+        self.view.setCameraPosition(
+            pos=c['pos'],
+            distance=c['distance'],
+            elevation=c['elevation'],
+            azimuth=c['azimuth'],
+        )
+
     def _add_grid_floor(self):
         """Add reference grid on the floor"""
         if not OPENGL_AVAILABLE:
@@ -682,8 +716,8 @@ class Spatial3DWidget(QWidget):
             base_size = 15 if index == 1 else 10
             size = base_size + max(0, (power_db + 60) / 5)  # Scale by power
             
-            # Alpha based on power
-            alpha = min(1.0, 0.5 + (power_db + 60) / 100)
+            # Alpha: yarı saydam sabit — arkasındaki grid ve laser görünsün
+            alpha = 0.45
             
             # Source position
             pos = np.array([[x, y, z]])

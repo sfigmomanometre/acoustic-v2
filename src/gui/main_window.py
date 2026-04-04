@@ -68,6 +68,9 @@ from algorithms.beamforming import (
     mvdr_beamformer_realtime,
     music_beamformer,
     music_beamformer_realtime,
+    hybrid_beamformer_realtime,
+    estimate_source_count,
+    detect_roi,
     power_to_db,
     normalize_power_map,
     BeamformingConfig,
@@ -547,20 +550,77 @@ class AcousticCameraGUI(QMainWindow):
             "DAS (Delay-and-Sum)",
             "MVDR (Minimum Variance)",
             "MUSIC",
+            "Hybrid (DAS→MUSIC)",
             "CLEAN-SC"
         ])
         self.algorithm_combo.currentTextChanged.connect(self._on_algorithm_changed)
         self.algorithm_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         layout.addWidget(self.algorithm_combo)
-        
-        # Number of sources (for MUSIC algorithm)
-        layout.addWidget(QLabel("Kaynak Sayısı (MUSIC için):"))
+
+        # Number of sources (for MUSIC / Hybrid manual mode)
+        self._n_sources_label = QLabel("Kaynak Sayısı (MUSIC için):")
+        layout.addWidget(self._n_sources_label)
         self.n_sources_spin = QSpinBox()
         self.n_sources_spin.setRange(1, 10)
         self.n_sources_spin.setValue(1)
-        self.n_sources_spin.setToolTip("MUSIC algoritması için beklenen kaynak sayısı")
+        self.n_sources_spin.setToolTip("MUSIC / Hybrid algoritması için beklenen kaynak sayısı")
         self.n_sources_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         layout.addWidget(self.n_sources_spin)
+
+        # ── Hybrid-specific options (hidden by default) ──────────────
+        self.hybrid_options_widget = QWidget()
+        hybrid_layout = QVBoxLayout()
+        hybrid_layout.setContentsMargins(0, 4, 0, 0)
+        hybrid_layout.setSpacing(6)
+
+        # Auto source count checkbox
+        self.hybrid_auto_sources_check = QCheckBox("Kaynak Sayısını Otomatik Tahmin Et")
+        self.hybrid_auto_sources_check.setChecked(True)
+        self.hybrid_auto_sources_check.setToolTip(
+            "İşaretliyse CSM eigenvalue analizi ile kaynak sayısı otomatik tahmin edilir"
+        )
+        self.hybrid_auto_sources_check.stateChanged.connect(self._on_hybrid_auto_sources_changed)
+        hybrid_layout.addWidget(self.hybrid_auto_sources_check)
+
+        # Estimated source count display
+        self.hybrid_sources_label = QLabel("Tahmin edilen kaynak sayısı: —")
+        self.hybrid_sources_label.setStyleSheet("color: #aaa; font-size: 11px;")
+        hybrid_layout.addWidget(self.hybrid_sources_label)
+
+        # ROI threshold slider
+        hybrid_layout.addWidget(QLabel("ROI Eşiği (dB, DAS tepesinden):"))
+        roi_row = QHBoxLayout()
+        self.hybrid_roi_slider = QSlider(Qt.Horizontal)
+        self.hybrid_roi_slider.setRange(3, 24)   # stored as positive; applied as negative
+        self.hybrid_roi_slider.setValue(12)       # default: -12 dB
+        self.hybrid_roi_slider.setTickInterval(3)
+        self.hybrid_roi_slider.setTickPosition(QSlider.TicksBelow)
+        self.hybrid_roi_label_val = QLabel("-12 dB")
+        self.hybrid_roi_slider.valueChanged.connect(
+            lambda v: self.hybrid_roi_label_val.setText(f"-{v} dB")
+        )
+        roi_row.addWidget(self.hybrid_roi_slider)
+        roi_row.addWidget(self.hybrid_roi_label_val)
+        hybrid_layout.addLayout(roi_row)
+
+        # Source count method selector
+        hybrid_layout.addWidget(QLabel("Kaynak Sayısı Yöntemi:"))
+        self.hybrid_method_combo = QComboBox()
+        self.hybrid_method_combo.addItems([
+            "gap  (Eigenvalue Sıçraması — önerilen)",
+            "mdl  (Minimum Description Length)",
+            "both (MDL ∩ Gap — muhafazakâr)",
+        ])
+        self.hybrid_method_combo.setToolTip(
+            "gap: pratik kullanım için daha hassas\n"
+            "mdl: akademik standart, az sayma eğilimli\n"
+            "both: ikisinin kesişimi, en az kaynak sayar"
+        )
+        hybrid_layout.addWidget(self.hybrid_method_combo)
+
+        self.hybrid_options_widget.setLayout(hybrid_layout)
+        self.hybrid_options_widget.setVisible(False)
+        layout.addWidget(self.hybrid_options_widget)
         
         # Frekans aralığı - DOUBLE RANGE SLIDER
         layout.addWidget(QLabel("Frekans Aralığı (Hz):"))
@@ -2307,13 +2367,35 @@ class AcousticCameraGUI(QMainWindow):
     def _on_algorithm_changed(self, algorithm_name):
         """Algoritma değiştiğinde"""
         logger.info(f"Algoritma değişti: {algorithm_name}")
-        # Enable/disable n_sources spinner based on algorithm
-        is_music = "MUSIC" in algorithm_name
-        self.n_sources_spin.setEnabled(is_music)
-        if is_music:
+
+        is_music  = algorithm_name == "MUSIC"
+        is_hybrid = "Hybrid" in algorithm_name
+
+        # Hybrid panel görünürlüğü
+        self.hybrid_options_widget.setVisible(is_hybrid)
+
+        if is_hybrid:
+            # Hybrid modda auto sources seçiliyse spinner'ı kapat
+            auto = self.hybrid_auto_sources_check.isChecked()
+            self.n_sources_spin.setEnabled(not auto)
+            self.n_sources_spin.setStyleSheet("" if not auto else "color: gray;")
+            self._n_sources_label.setText("Kaynak Sayısı (manuel, auto kapalıysa):")
+        elif is_music:
+            self.n_sources_spin.setEnabled(True)
             self.n_sources_spin.setStyleSheet("")
+            self._n_sources_label.setText("Kaynak Sayısı (MUSIC için):")
         else:
+            self.n_sources_spin.setEnabled(False)
             self.n_sources_spin.setStyleSheet("color: gray;")
+            self._n_sources_label.setText("Kaynak Sayısı (MUSIC için):")
+
+    def _on_hybrid_auto_sources_changed(self, state):
+        """Hybrid modda otomatik kaynak sayısı toggle"""
+        auto = (state == Qt.CheckState.Checked.value)
+        self.n_sources_spin.setEnabled(not auto)
+        self.n_sources_spin.setStyleSheet("" if not auto else "color: gray;")
+        if auto:
+            self.hybrid_sources_label.setText("Tahmin edilen kaynak sayısı: —")
     
     def _on_beamforming_toggle(self, state):
         """Beamforming checkbox toggle"""
@@ -2626,9 +2708,32 @@ class AcousticCameraGUI(QMainWindow):
             # Get selected algorithm and n_sources
             algorithm = self.algorithm_combo.currentText()
             n_sources = self.n_sources_spin.value()
-            
+            n_src_used = n_sources  # may be overwritten by Hybrid auto-estimation
+
             # Run selected beamformer (using REALTIME optimized versions)
-            if "MVDR" in algorithm or "Minimum Variance" in algorithm:
+            if "Hybrid" in algorithm:
+                roi_threshold = -float(self.hybrid_roi_slider.value())
+                auto_src = self.hybrid_auto_sources_check.isChecked()
+                # Parse method from combo: "gap  (..." → "gap"
+                src_method = self.hybrid_method_combo.currentText().split()[0]
+                power_map, n_src_used, _roi_mask = hybrid_beamformer_realtime(
+                    audio_data,
+                    self.mic_positions,
+                    self.grid_points,
+                    sample_rate,
+                    self.beamforming_config,
+                    max_freq_bins=self.max_freq_bins,
+                    distances=self.cached_distances,
+                    roi_threshold_db=roi_threshold,
+                    auto_sources=auto_src,
+                    n_sources=n_sources,
+                    source_count_method=src_method,
+                )
+                # Update estimated source count label
+                self.hybrid_sources_label.setText(
+                    f"Tahmin edilen kaynak sayısı: {n_src_used}"
+                )
+            elif "MVDR" in algorithm or "Minimum Variance" in algorithm:
                 power_map = mvdr_beamformer_realtime(
                     audio_data,
                     self.mic_positions,
@@ -2667,8 +2772,8 @@ class AcousticCameraGUI(QMainWindow):
             # Reshape to 2D grid
             power_grid = power_db.reshape(self.grid_shape)
             
-            # Find multiple peaks in power grid
-            self.detected_peaks = self._detect_multiple_peaks(power_grid, power_db, n_sources)
+            # Find multiple peaks in power grid — use actual source count for Hybrid mode
+            self.detected_peaks = self._detect_multiple_peaks(power_grid, power_db, n_src_used)
             # Keep legacy single peak for compatibility
             self.detected_peak = self.detected_peaks[0] if self.detected_peaks else None
             
