@@ -181,20 +181,23 @@ class AudioStreamThread(QThread):
         
         return np.array(recent_data)
     
-    def get_db_levels(self) -> np.ndarray:
+    def get_db_levels(self, spl_offset: float = 0.0) -> np.ndarray:
         """
-        RMS seviyelerini dB cinsinden döndür
-        
+        RMS seviyelerini dB cinsinden döndür.
+
+        Args:
+            spl_offset: dBFS → dBSPL dönüşüm offseti (örn: 120 dB).
+                        0 ise dBFS döner (geriye uyumlu).
+
         Returns:
-            (channels,) shape - dB değerleri (-60 to 0 range)
+            (channels,) shape — dBSPL veya dBFS değerleri.
         """
-        # RMS'i dB'ye çevir
-        # dB = 20 * log10(rms / reference)
-        # reference = 1.0 (full scale)
-        
-        db_levels = 20 * np.log10(self.peak_levels + 1e-10)  # +epsilon log(0) için
-        
-        # -60 ile 0 arasına kliple
-        db_levels = np.clip(db_levels, -60, 0)
-        
+        db_levels = 20 * np.log10(self.peak_levels + 1e-10) + spl_offset
+
+        # Clip aralığı: dBSPL modda 30–130, dBFS modda -60–0
+        if spl_offset > 0:
+            db_levels = np.clip(db_levels, 40.0, 120.0)
+        else:
+            db_levels = np.clip(db_levels, -60.0, 0.0)
+
         return db_levels

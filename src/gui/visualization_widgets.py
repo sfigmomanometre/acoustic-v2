@@ -28,17 +28,18 @@ class SpectrogramWidget(QWidget):
         self.sample_rate = sample_rate
         self.window_duration = window_duration
         self.window_samples = int(sample_rate * window_duration)
-        
+        self.spl_offset = 0.0  # dBFS → dBSPL offset
+
         # STFT parametreleri
-        self.nperseg = 2048  # FFT window size
+        self.nperseg = 2048
         self.noverlap = self.nperseg // 2
         self.nfft = 2048
-        
+
         # Spektrogram data buffer
         self.spectrogram_data = None
         self.time_axis = None
         self.freq_axis = None
-        
+
         # Selected channel (0 = all channels average, 1-16 = specific channel)
         self.selected_channel = 0
         
@@ -167,15 +168,16 @@ class SpectrogramWidget(QWidget):
                 scaling='density'
             )
             
-            # dB'ye çevir
-            Sxx_db = 10 * np.log10(Sxx + 1e-10)  # Avoid log(0)
+            # dB'ye çevir (SPL offset ekle)
+            Sxx_db = 10 * np.log10(Sxx + 1e-10) + self.spl_offset
             
             # Adaptive normalization - dinamik range
             # Her frame için min/max al, daha iyi görselleştirme
             percentile_low = np.percentile(Sxx_db, 10)  # Alt %10
             percentile_high = np.percentile(Sxx_db, 95)  # Üst %95
             
-            vmin = max(percentile_low, -100)  # Çok düşük değerleri kes
+            vmin_floor = (self.spl_offset - 100) if self.spl_offset > 0 else -100
+            vmin = max(percentile_low, vmin_floor)  # Çok düşük değerleri kes
             vmax = percentile_high
             
             # Normalize (0-1 arası)
@@ -207,6 +209,10 @@ class SpectrogramWidget(QWidget):
         except Exception as e:
             logger.error(f"Spektrogram update error: {e}")
     
+    def set_spl_offset(self, offset: float):
+        """SPL offset'i güncelle."""
+        self.spl_offset = offset
+
     def clear(self):
         """Spektrogramı temizle"""
         if self.image_item is not None:
@@ -223,21 +229,22 @@ class WaveformWidget(QWidget):
     
     def __init__(self, sample_rate=48000, fft_size=2048):
         super().__init__()
-        
+
         self.sample_rate = sample_rate
         self.fft_size = fft_size
-        
+        self.spl_offset = 0.0  # dBFS → dBSPL offset (0 = dBFS modu)
+
         # Peak hold for FFT bins
         self.peak_data = None
-        self.peak_decay = 0.90  # Hızlı decay
-        
+        self.peak_decay = 0.90
+
         # Selected channel
         self.selected_channel = 0  # 0 = average, 1-16 = specific
-        
+
         # Crosshair data
         self.current_freqs = None
         self.current_fft_db = None
-        
+
         self._init_ui()
         
         logger.info("FFT Spectrum Widget initialized (Dark Theme + Logarithmic)")
@@ -415,8 +422,8 @@ class WaveformWidget(QWidget):
             fft_data = np.fft.rfft(windowed_signal)
             fft_magnitude = np.abs(fft_data)
             
-            # dB'ye çevir
-            fft_db = 20 * np.log10(fft_magnitude + 1e-10)  # Avoid log(0)
+            # dB'ye çevir (SPL offset ekle)
+            fft_db = 20 * np.log10(fft_magnitude + 1e-10) + self.spl_offset
             
             # Frekans ekseni
             freqs = np.fft.rfftfreq(len(signal_data), 1.0 / self.sample_rate)
@@ -452,6 +459,17 @@ class WaveformWidget(QWidget):
         except Exception as e:
             logger.error(f"FFT Spectrum update error: {e}")
     
+    def set_spl_offset(self, offset: float):
+        """SPL offset'i güncelle ve Y eksenini yeniden ölçekle."""
+        self.spl_offset = offset
+        self.peak_data = None  # Peak hold sıfırla
+        if offset > 0:
+            self.plot_widget.setYRange(40, 120)
+            self.plot_widget.setLabel('left', 'Güç (dBSPL)', color='#cccccc')
+        else:
+            self.plot_widget.setYRange(-80, 0)
+            self.plot_widget.setLabel('left', 'Güç (dBFS)', color='#cccccc')
+
     def clear(self):
         """FFT Spektrum'u temizle"""
         self.spectrum_curve.clear()
@@ -712,9 +730,13 @@ class Spatial3DWidget(QWidget):
             # Convert BGR to RGB and normalize
             color_rgb = (color_bgr[2] / 255.0, color_bgr[1] / 255.0, color_bgr[0] / 255.0)
             
-            # Size based on power (larger = louder)
+            # Size based on power (larger = louder) — normalize to 0–1 regardless of dBFS/dBSPL
             base_size = 15 if index == 1 else 10
-            size = base_size + max(0, (power_db + 60) / 5)  # Scale by power
+            if power_db > 30:  # dBSPL mode (40–120 range)
+                normalized_power = max(0.0, (power_db - 40) / 80.0)
+            else:              # dBFS mode (−60–0 range)
+                normalized_power = max(0.0, (power_db + 60) / 60.0)
+            size = base_size + normalized_power * 20
             
             # Alpha: yarı saydam sabit — arkasındaki grid ve laser görünsün
             alpha = 0.45

@@ -1,132 +1,94 @@
-# UMA-16 Akustik Kamera Sistemi - Konfigürasyon
-
-# ===== Ses Ayarları =====
 audio:
-  sample_rate: 48000          # Hz - UMA-16 desteklenen rate
-  channels: 16                # miniDSP UMA-16 kanal sayısı
-  chunk_size: 4096            # Samples per buffer (trade-off: latency vs stability)
-  device_name: "UMA-16"       # Cihaz ismi (substring match)
-  dtype: "float32"            # Veri tipi
-  
-  # Ön işleme
+  channels: 16
+  chunk_size: 4096
+  device_name: UMA-16
+  dtype: float32
   preprocessing:
     enable: true
-    highpass_cutoff: 100      # Hz - Düşük frekans filtreleme
-    lowpass_cutoff: 10000     # Hz - Yüksek frekans filtreleme
-
-# ===== Mikrofon Geometrisi =====
-microphone:
-  geometry_file: "config/micgeom.xml"
-  array_type: "circular"      # UMA-16 dairesel dizi
-  radius: 0.044               # metre - UMA-16 yarıçapı
-  center: [0.0, 0.0, 0.0]     # Reference merkez nokta
-
-# ===== Beamforming Ayarları =====
+    highpass_cutoff: 100
+    lowpass_cutoff: 10000
+  sample_rate: 48000
 beamforming:
-  algorithm: "DAS"            # DAS, MVDR, MUSIC, CLEAN-SC
-  
-  # Frekans aralığı
+  algorithm: DAS
   frequency:
-    min: 500                  # Hz
-    max: 8000                 # Hz
-    bands: 3                  # Octave band sayısı (opsiyonel)
-  
-  # Hesaplama grid'i (odak noktaları)
+    bands: 3
+    max: 8000
+    min: 500
   grid:
-    type: "rectangular"       # rectangular, spherical
-    x_range: [-1.5, 1.5]      # metre
-    y_range: [-1.5, 1.5]      # metre  
-    z: 1.0                    # metre (sabit mesafe - kamera düzlemi)
-    resolution: 0.05          # metre (çözünürlük)
-    
-  # Algoritma parametreleri
+    resolution: 0.05
+    type: rectangular
+    x_range:
+    - -1.5
+    - 1.5
+    y_range:
+    - -1.5
+    - 1.5
+    z: 1.0
   params:
-    # DAS için
-    r_diag: false             # Diagonal removal
-    
-    # MVDR için (gelecekte)
-    # diagonal_loading: 0.01
-    
-    # MUSIC için (gelecekte)
-    # num_sources: 2
-
-# ===== Video Ayarları =====
-video:
-  enable: true
-  device_id: 0                # USB kamera ID (0 = default)
-  resolution:
-    width: 1920
-    height: 1080
-  fps: 30
-  
-  # Kamera kalibrasyonu (opsiyonel)
-  calibration:
-    enable: true
-    fov: 100                  # Derece - Field of view (yatay)
-    position: [0.0, 0.0, 0.0] # Kameranın mikrofon dizisine göre pozisyonu (metre)
-
-# ===== Görselleştirme =====
-visualization:
-  # Akustik harita
-  colormap: "jet"             # jet, hot, viridis
-  dynamic_range: 15           # dB - Gösterilecek dinamik aralık
-  normalization: "auto"       # auto, fixed
-  
-  # Video overlay
-  overlay:
-    enable: true
-    alpha: 0.6                # Şeffaflık (0.0-1.0)
-    blend_mode: "additive"    # additive, multiply
-  
-  # Real-time display
-  update_rate: 10             # Hz - Görüntü güncelleme hızı
-  interpolation: "bilinear"   # none, bilinear, bicubic
-
-# ===== Veri Saklama =====
-storage:
-  enable_recording: false
-  output_dir: "data/recordings"
-  format: "hdf5"              # hdf5, wav
-  
-  # Metadata
-  save_metadata: true
-  metadata_fields:
-    - timestamp
-    - config
-    - geometry
-
-# ===== Performans =====
-performance:
-  use_multiprocessing: false  # Multi-core kullanımı
-  num_workers: 4              # İşlemci sayısı
-  use_gpu: false              # GPU hızlandırma (gelecekte)
-  
-  # Memory management
-  buffer_size: 10             # Saniye cinsinden buffer
-  cache_results: true
-
-# ===== Debug & Logging =====
-debug:
-  verbose: true
-  log_level: "INFO"           # DEBUG, INFO, WARNING, ERROR
-  log_file: "acoustic_camera.log"
-  show_timing: true           # İşlem sürelerini göster
-  plot_intermediate: false    # Ara sonuçları görselleştir
-
-# ===== Kalibrasyon =====
+    r_diag: false
 calibration:
-  # Mikrofon hassasiyet kalibrasyonu
+  calibrated: true
+  environment:
+    humidity: 50
+    pressure: 101325
+    temperature: 20
   mic_sensitivity:
     enable: false
-    reference_file: "data/calibration/sensitivity.txt"
-  
-  # Faz kalibrasyonu
+    reference_file: data/calibration/sensitivity.txt
   phase_calibration:
     enable: false
-    reference_file: "data/calibration/phase.txt"
-  
-  # Ortam kompensasyonu
-  environment:
-    temperature: 20           # Celsius
-    pressure: 101325          # Pascal
-    humidity: 50              # %
+    reference_file: data/calibration/phase.txt
+  spl_offset_db: 76.5
+debug:
+  log_file: acoustic_camera.log
+  log_level: INFO
+  plot_intermediate: false
+  show_timing: true
+  verbose: true
+microphone:
+  array_type: circular
+  center:
+  - 0.0
+  - 0.0
+  - 0.0
+  geometry_file: config/micgeom.xml
+  radius: 0.044
+performance:
+  buffer_size: 10
+  cache_results: true
+  num_workers: 4
+  use_gpu: false
+  use_multiprocessing: false
+storage:
+  enable_recording: false
+  format: hdf5
+  metadata_fields:
+  - timestamp
+  - config
+  - geometry
+  output_dir: data/recordings
+  save_metadata: true
+video:
+  calibration:
+    enable: true
+    fov: 100
+    position:
+    - 0.0
+    - 0.0
+    - 0.0
+  device_id: 0
+  enable: true
+  fps: 30
+  resolution:
+    height: 1080
+    width: 1920
+visualization:
+  colormap: jet
+  dynamic_range: 15
+  interpolation: bilinear
+  normalization: auto
+  overlay:
+    alpha: 0.6
+    blend_mode: additive
+    enable: true
+  update_rate: 10

@@ -294,21 +294,27 @@ def das_beamformer(
     return power_map
 
 
-def power_to_db(power_map: np.ndarray, reference: float = 1.0) -> np.ndarray:
+def power_to_db(
+    power_map: np.ndarray,
+    reference: float = 1.0,
+    spl_offset: float = 0.0,
+) -> np.ndarray:
     """
-    Convert power map to dB scale
-    
+    Convert power map to dB scale, with optional dBFS → dBSPL offset.
+
     Args:
-        power_map: Linear power values
-        reference: Reference power (default: 1.0)
-        
+        power_map:  Linear power values (beamformer output).
+        reference:  Reference power (default 1.0 = full scale).
+        spl_offset: Offset added after dB conversion to shift from dBFS to
+                    dBSPL (e.g. 120 dB for UMA-16v2 MEMS microphones).
+                    Default 0 → backwards-compatible (dBFS output).
+
     Returns:
-        power_db: Power in dB (10 * log10(power / reference))
+        power_db: Power in dB (10·log₁₀(power/reference) + spl_offset)
     """
-    # Avoid log(0)
     power_map_safe = np.maximum(power_map, 1e-10)
     power_db = 10 * np.log10(power_map_safe / reference)
-    return power_db
+    return power_db + spl_offset
 
 
 def compute_covariance_matrix(

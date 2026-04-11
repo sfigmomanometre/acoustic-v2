@@ -225,7 +225,10 @@ class AcousticCameraGUI(QMainWindow):
         
         # Initialize beamforming (load geometry, create grid)
         self._init_beamforming()
-        
+
+        # Config'den SPL offset yükle (kalibrasyon kaydedilmişse)
+        self._load_spl_offset_from_config()
+
         logger.info("GUI başlatıldı")
     
     def _init_ui(self):
@@ -629,10 +632,57 @@ class AcousticCameraGUI(QMainWindow):
         self.freq_range_slider.rangeChanged.connect(self.on_freq_range_changed)
         layout.addWidget(self.freq_range_slider)
         
-        # Ses Şiddeti Aralığı (dB) - DOUBLE RANGE SLIDER
-        layout.addWidget(QLabel("Ses Şiddeti Aralığı (dB):"))
-        self.db_range_slider = DoubleRangeSlider(-60, 0)
-        self.db_range_slider.setValues(-40, -10)
+        # ── SPL KALİBRASYON ──────────────────────────────────────────────
+        cal_sep = QLabel("<b>SPL Kalibrasyonu:</b>")
+        cal_sep.setStyleSheet("margin-top: 8px;")
+        layout.addWidget(cal_sep)
+
+        # dBSPL / dBFS toggle
+        self.spl_mode_check = QCheckBox("dBSPL Modu (dBFS→dBSPL dönüşümü)")
+        self.spl_mode_check.setChecked(True)
+        self.spl_mode_check.setToolTip(
+            "İşaretli: tüm grafikler ve değerler dBSPL cinsinden gösterilir.\n"
+            "İşaretsiz: ham dBFS değerleri (negatif, −80…0 arası)."
+        )
+        self.spl_mode_check.stateChanged.connect(self._on_spl_mode_changed)
+        layout.addWidget(self.spl_mode_check)
+
+        # Offset spinbox
+        cal_row = QHBoxLayout()
+        cal_row.addWidget(QLabel("dBFS→dBSPL Offset:"))
+        self.spl_offset_spin = QDoubleSpinBox()
+        self.spl_offset_spin.setRange(0.0, 100.0)
+        self.spl_offset_spin.setValue(59.0)
+        self.spl_offset_spin.setSingleStep(0.5)
+        self.spl_offset_spin.setDecimals(1)
+        self.spl_offset_spin.setSuffix(" dB")
+        self.spl_offset_spin.setToolTip(
+            "Beamformer peak çıkışından dBSPL'e dönüşüm offseti.\n"
+            "UMA-16v2 + DAS teorik değeri: ~59 dB\n"
+            "(Tek kanal RMS tabanlı ~120 dB DEĞİL — farklı ölçek!)\n"
+            "'Kalibrasyon Yap' ile telefon SPL uygulaması üzerinden hassaslaştırın."
+        )
+        self.spl_offset_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.spl_offset_spin.valueChanged.connect(self._on_spl_offset_changed)
+        cal_row.addWidget(self.spl_offset_spin)
+        layout.addLayout(cal_row)
+
+        # Kalibrasyon butonu
+        cal_btn = QPushButton("Kalibrasyon Yap")
+        cal_btn.setToolTip(
+            "Telefonu mikrofon dizisinin yanına tutun.\n"
+            "Beamformer peak çıkışını telefon SPL uygulamasına göre kalibre eder.\n"
+            "DİKKAT: Kalibrasyon sırasında ortamda ses olmalı (ör. konuşun)."
+        )
+        cal_btn.clicked.connect(self._do_spl_calibration)
+        layout.addWidget(cal_btn)
+
+        # Ses Şiddeti Aralığı (dB) - DOUBLE RANGE SLIDER (dBSPL aralığında)
+        spl_sep2 = QLabel("<b>Görüntüleme Aralığı:</b>")
+        spl_sep2.setStyleSheet("margin-top: 4px;")
+        layout.addWidget(spl_sep2)
+        self.db_range_slider = DoubleRangeSlider(30, 130)
+        self.db_range_slider.setValues(40, 120)
         self.db_range_slider.rangeChanged.connect(self.on_db_range_changed)
         layout.addWidget(self.db_range_slider)
         
@@ -1434,16 +1484,23 @@ class AcousticCameraGUI(QMainWindow):
         ]
         primary_color, secondary_color = source_colors[(idx - 1) % len(source_colors)]
         
-        # Level indicator - Türkçe
-        if db > -20:
+        # Level indicator — mutlak eşikler (offset'ten bağımsız)
+        _offset = self._get_spl_offset()
+        if _offset > 0:  # dBSPL modu: gerçek akustik düzeylere göre
+            _high_thr = 70.0   # 70 dBSPL = yüksek sesli konuşma
+            _mid_thr  = 55.0   # 55 dBSPL = normal konuşma
+        else:            # dBFS modu: beamformer ham birimi
+            _high_thr = -25.0  # yaklaşık yüksek
+            _mid_thr  = -40.0  # yaklaşık orta
+        if db > _high_thr:
             level_text = "Yüksek"
-            level_color = "#ff4444"  # Kırmızı
-        elif db > -35:
+            level_color = "#ff4444"
+        elif db > _mid_thr:
             level_text = "Orta"
-            level_color = "#ffaa00"  # Turuncu
+            level_color = "#ffaa00"
         else:
             level_text = "Düşük"
-            level_color = "#44cc44"  # Yeşil
+            level_color = "#44cc44"
         
         # === Header Row ===
         header_layout = QHBoxLayout()
@@ -1491,21 +1548,27 @@ class AcousticCameraGUI(QMainWindow):
         power_icon.setStyleSheet("font-size: 12px;")
         power_layout.addWidget(power_icon)
         
-        power_value = QLabel(f"{db:+.1f} dB")
+        _offset = self._get_spl_offset()
+        _unit = "dBSPL" if _offset > 0 else "dBFS"
+        power_value = QLabel(f"{db:.1f} {_unit}")
         power_value.setStyleSheet(f"""
-            color: {primary_color}; 
+            color: {primary_color};
             font-family: 'Consolas', 'Monaco', monospace;
-            font-weight: bold; 
+            font-weight: bold;
             font-size: 13px;
-            min-width: 70px;
+            min-width: 80px;
         """)
         power_layout.addWidget(power_value)
-        
-        # LED Bar (custom styled progress)
+
+        # LED Bar — mutlak aralık (offset'ten bağımsız)
+        if _offset > 0:  # dBSPL: 30–90 dBSPL
+            _bar_min, _bar_max = 30, 90
+        else:            # dBFS beamformer ham birimi
+            _bar_min, _bar_max = -60, 0
         led_bar = QProgressBar()
-        led_bar.setMinimum(-60)
-        led_bar.setMaximum(0)
-        led_bar.setValue(int(max(-60, min(0, db))))
+        led_bar.setMinimum(_bar_min)
+        led_bar.setMaximum(_bar_max)
+        led_bar.setValue(int(max(_bar_min, min(_bar_max, db))))
         led_bar.setTextVisible(False)
         led_bar.setFixedHeight(8)
         led_bar.setStyleSheet(f"""
@@ -2329,6 +2392,175 @@ class AcousticCameraGUI(QMainWindow):
             logger.error(f"Overlay uygulama hatası: {e}")
             return frame
     
+    # ──────────────────────────────────────────────────────────────────────────
+    # SPL Kalibrasyon
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _get_spl_offset(self) -> float:
+        """Aktif SPL offset'ini döndür. dBSPL modu kapalıysa 0.0."""
+        if hasattr(self, 'spl_mode_check') and not self.spl_mode_check.isChecked():
+            return 0.0
+        return self.spl_offset_spin.value() if hasattr(self, 'spl_offset_spin') else 0.0
+
+    def _on_spl_mode_changed(self, state):
+        """dBSPL/dBFS toggle — tüm grafikleri ve etiketleri güncelle."""
+        offset = self._get_spl_offset()
+        unit = "dBSPL" if offset > 0 else "dBFS"
+
+        # FFT widget
+        if hasattr(self, 'waveform_widget') and self.waveform_widget is not None:
+            self.waveform_widget.set_spl_offset(offset)
+
+        # Spektrogram widget
+        if hasattr(self, 'spectrogram_widget') and self.spectrogram_widget is not None:
+            self.spectrogram_widget.set_spl_offset(offset)
+
+        # dB slider aralığını güncelle
+        if hasattr(self, 'db_range_slider'):
+            if offset > 0:
+                self.db_range_slider.setRange(30, 130)
+                self.db_range_slider.setValues(40, 120)
+            else:
+                self.db_range_slider.setRange(-80, 0)
+                self.db_range_slider.setValues(-60, 0)
+
+        logger.info(f"SPL modu değişti → offset={offset:.1f} dB ({unit})")
+
+    def _on_spl_offset_changed(self, value: float):
+        """SPL offset spinbox değiştiğinde — tüm grafikleri güncelle."""
+        logger.info(f"SPL offset güncellendi: {value:.1f} dB")
+        # Mod aktifse grafikleri yenile
+        if hasattr(self, 'spl_mode_check') and self.spl_mode_check.isChecked():
+            self._on_spl_mode_changed(None)
+
+    def _do_spl_calibration(self):
+        """
+        Kullanıcıdan bilinen bir SPL değeri alır, beamformer peak output'u
+        ölçer ve farktan SPL offset'ini hesaplar.
+
+        Neden beamformer peak kullanıyoruz?
+        ─────────────────────────────────────────────────────────────────
+        DAS beamformer çıkışı, tek kanal RMS'den sistematik olarak farklıdır:
+          • 16 kanal koherent toplama  → +20·log10(16) ≈ +24 dB
+          • Normalleştirilmemiş FFT   → +20·log10(n_samples) ≈ +74 dB
+          • Frekans bin ortalaması    → −10·log10(n_bins) ≈ −28 dB
+        Toplam fark ≈ +70 dB civarındadır; bu yüzden tek kanal RMS ile
+        kalibre edilmiş offset, beamformer görüntüsünde ~70 dB yüksek değer
+        üretir (konuşurken 110-120 dBSPL gibi saçma sonuçlar).
+
+        Doğru yaklaşım: offset'i beamformer'ın kendi peak çıkışından hesapla.
+        Bu sayede her iki tarafta da aynı skala kullanılmış olur.
+        ─────────────────────────────────────────────────────────────────
+        """
+        from PySide6.QtWidgets import QInputDialog, QMessageBox
+
+        if self.audio_thread is None or not self.audio_thread.isRunning():
+            QMessageBox.warning(self, "Kalibrasyon",
+                                "Sistem çalışmıyor. Önce 'BAŞLAT' butonuna basın.")
+            return
+
+        if self.mic_positions is None or self.grid_points is None:
+            QMessageBox.warning(self, "Kalibrasyon",
+                                "Beamforming henüz başlatılmadı. Geometri yüklenemedi.")
+            return
+
+        # 1) Kullanıcıdan referans SPL değerini al
+        ref_spl, ok = QInputDialog.getDouble(
+            self,
+            "SPL Kalibrasyonu",
+            "Telefon SPL uygulamasının ŞU AN gösterdiği değeri girin (dBSPL):\n"
+            "(Telefonu mikrofon dizisinin yanına, aynı mesafeye tutun)",
+            65.0, 20.0, 140.0, 1
+        )
+        if not ok:
+            return
+
+        try:
+            # 2) Kısa bir ses tamponu al (beamformer ile aynı uzunluk: 0.1 saniye)
+            buf = self.audio_thread.get_buffer_data(duration=0.1)
+            if buf is None or buf.size == 0:
+                raise ValueError("Ses tamponu boş.")
+            if buf.shape[0] < 512:
+                raise ValueError("Yeterli ses verisi yok (en az 0.1 saniye bekleniyor).")
+
+            # 3) Beamformer peak'ini hesapla — görüntüleme ile AYNI hesaplama
+            from algorithms.beamforming import das_beamformer_realtime, power_to_db as _p2db
+            sample_rate = self.audio_thread.sample_rate
+
+            power_map_cal = das_beamformer_realtime(
+                buf,
+                self.mic_positions,
+                self.grid_points,
+                sample_rate,
+                self.beamforming_config,
+                max_freq_bins=self.max_freq_bins,
+                distances=self.cached_distances,
+            )
+            peak_power = float(np.max(power_map_cal))
+            if peak_power < 1e-30:
+                raise ValueError("Beamformer sinyali çok düşük (ses algılanamıyor).")
+
+            # 10·log10(peak) — spl_offset=0 ile ham dBFS-beamformer değeri
+            peak_dbfs_beam = float(10 * np.log10(peak_power))
+
+            # 4) Offset hesapla
+            new_offset = ref_spl - peak_dbfs_beam
+            new_offset = round(new_offset * 2) / 2  # 0.5 dB hassasiyetine yuvarla
+
+            self.spl_offset_spin.setValue(new_offset)
+            logger.info(
+                f"Kalibrasyon (beamformer peak): ref={ref_spl} dBSPL, "
+                f"peak_beam={peak_dbfs_beam:.1f} dBFS-beam, offset={new_offset:.1f} dB"
+            )
+
+            # 5) Config dosyasını güncelle
+            self._save_spl_offset_to_config(new_offset)
+
+            QMessageBox.information(
+                self, "Kalibrasyon Tamamlandı",
+                f"Beamformer peak: {peak_dbfs_beam:.1f} dBFS-beam\n"
+                f"Referans dBSPL : {ref_spl:.1f}\n"
+                f"Yeni offset    : {new_offset:.1f} dB\n\n"
+                f"Not: Kalibrasyon sırasında telefon SPL uygulaması ile\n"
+                f"aynı ortam sesi ölçülmüştür."
+            )
+
+        except Exception as e:
+            QMessageBox.warning(self, "Kalibrasyon Hatası", str(e))
+
+    def _save_spl_offset_to_config(self, offset: float):
+        """offset değerini config/config.yaml'a yazar."""
+        try:
+            import yaml
+            config_path = Path(__file__).resolve().parent.parent.parent / "config" / "config.yaml"
+            with open(config_path, "r") as f:
+                cfg = yaml.safe_load(f)
+            cfg.setdefault("calibration", {})
+            cfg["calibration"]["spl_offset_db"] = float(offset)
+            cfg["calibration"]["calibrated"] = True
+            with open(config_path, "w") as f:
+                yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
+            logger.info(f"SPL offset config'e kaydedildi: {offset} dB")
+        except Exception as e:
+            logger.warning(f"Config kaydetme hatası: {e}")
+
+    def _load_spl_offset_from_config(self):
+        """Uygulama açılışında config'deki SPL offset'ini spinbox'a yükler."""
+        try:
+            import yaml
+            config_path = Path(__file__).resolve().parent.parent.parent / "config" / "config.yaml"
+            with open(config_path, "r") as f:
+                cfg = yaml.safe_load(f)
+            offset = cfg.get("calibration", {}).get("spl_offset_db", 59.0)
+            if hasattr(self, 'spl_offset_spin'):
+                # Spinbox aralığına sığdır (eski config'lerde 120 gibi değerler gelebilir)
+                lo = self.spl_offset_spin.minimum()
+                hi = self.spl_offset_spin.maximum()
+                self.spl_offset_spin.setValue(float(max(lo, min(hi, float(offset)))))
+                logger.info(f"Config'den SPL offset yüklendi: {offset} dB")
+        except Exception as e:
+            logger.debug(f"SPL offset config yüklenemedi: {e}")
+
     def on_freq_range_changed(self, min_val, max_val):
         """Frekans aralığı değiştiğinde"""
         logger.debug(f"Frekans aralığı: {min_val} - {max_val} Hz")
@@ -2766,8 +2998,8 @@ class AcousticCameraGUI(QMainWindow):
                     distances=self.cached_distances
                 )
             
-            # Convert to dB
-            power_db = power_to_db(power_map)
+            # Convert to dB (dBSPL offset uygulanır)
+            power_db = power_to_db(power_map, spl_offset=self._get_spl_offset())
             
             # Reshape to 2D grid
             power_grid = power_db.reshape(self.grid_shape)
@@ -3189,7 +3421,8 @@ class AcousticCameraGUI(QMainWindow):
                 cv2.circle(frame, (panel_x + 15, text_y - 5), 4, src_color, -1, cv2.LINE_AA)
                 
                 # Source info
-                info_text = f"#{i+1}: {peak['power_db']:.1f}dB ({peak['x']*100:.0f},{peak['y']*100:.0f})cm"
+                _hud_unit = "dBSPL" if self._get_spl_offset() > 0 else "dBFS"
+                info_text = f"#{i+1}: {peak['power_db']:.1f}{_hud_unit} ({peak['x']*100:.0f},{peak['y']*100:.0f})cm"
                 cv2.putText(frame, info_text, (panel_x + 25, text_y), 
                            font, font_scale, (200, 200, 200), 1, cv2.LINE_AA)
     
