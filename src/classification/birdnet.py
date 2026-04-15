@@ -22,6 +22,15 @@ logger = logging.getLogger(__name__)
 
 BIRDNET_SAMPLE_RATE = 48000
 
+# Location filter açıkken bile her zaman dahil edilecek etiketler.
+# Bu etiketler BirdNET model label listesindeki tam string'lerdir.
+ALWAYS_INCLUDE_LABELS = [
+    "Human non-vocal_Human non-vocal",
+    "Human vocal_Human vocal",
+    "Human whistle_Human whistle",
+    "Noise_Noise",
+]
+
 
 def _ensure_venv_on_path():
     """Projenin .venv/site-packages dizinini sys.path'e ekle (idempotent)."""
@@ -161,6 +170,9 @@ class BirdNETClassifier:
         min_confidence: Optional[float] = None,
         overlap: float = 0.0,
         channel: int = 0,
+        lat: float = -1,
+        lon: float = -1,
+        include_human: bool = True,
     ) -> list[dict]:
         """
         Numpy ses dizisini analiz et.
@@ -169,6 +181,8 @@ class BirdNETClassifier:
             audio_np: (samples,) veya (samples, channels) şeklinde numpy dizisi.
             sample_rate: Ses örnekleme hızı (Hz). 48000 değilse yeniden örneklenir.
             channel: Çok kanallı giriş için kanal indeksi.
+            lat: Enlem (lokasyon filtresi için). -1 = filtre kapalı.
+            lon: Boylam (lokasyon filtresi için). -1 = filtre kapalı.
 
         Returns:
             classify_file ile aynı format.
@@ -187,6 +201,9 @@ class BirdNETClassifier:
             date=date,
             min_confidence=min_confidence if min_confidence is not None else self.min_confidence,
             overlap=overlap,
+            lat=lat,
+            lon=lon,
+            include_human=include_human,
         )
 
     # ------------------------------------------------------------------
@@ -248,8 +265,17 @@ class BirdNETClassifier:
         date: Optional[datetime],
         min_confidence: float,
         overlap: float = 0.0,
+        lat: float = -1,
+        lon: float = -1,
+        include_human: bool = True,
     ) -> list[dict]:
-        """Mono numpy dizisini BytesIO WAV olarak birdnetlib'e gönder."""
+        """Mono numpy dizisini BytesIO WAV olarak birdnetlib'e gönder.
+
+        lat/lon=-1 → lokasyon filtresi kapalı (birdnetlib varsayılan davranışı).
+        lat/lon verilirse yalnızca o bölgede görülebilen türler döner.
+        include_human=True → lokasyon filtresi açık olsa bile ALWAYS_INCLUDE_LABELS
+        (Human non-vocal, Human vocal, Human whistle, Noise) listeye eklenir.
+        """
         import soundfile as sf
         from birdnetlib.main import RecordingFileObject
 
@@ -267,7 +293,16 @@ class BirdNETClassifier:
                 sensitivity=self.sensitivity,
                 min_conf=min_confidence,
                 overlap=overlap,
+                lat=lat,
+                lon=lon,
             )
+            # Lokasyon filtresi aktifken insan/gürültü etiketleri silinir.
+            # include_human=True ise bunları predicted_species_list'e geri ekle.
+            if include_human and lat != -1:
+                sp_list = analyzer.predicted_species_list
+                for label in ALWAYS_INCLUDE_LABELS:
+                    if label not in sp_list:
+                        sp_list.append(label)
             rec.analyze()
         return rec.detections
 

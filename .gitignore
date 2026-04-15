@@ -46,3 +46,4 @@ temp/
 *.mp4
 /docs
 /data/bird_detections
+/data/snapshots

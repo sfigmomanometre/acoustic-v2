@@ -38,7 +38,7 @@ calibration:
   phase_calibration:
     enable: false
     reference_file: data/calibration/phase.txt
-  spl_offset_db: 76.5
+  spl_offset_db: 69.5
 debug:
   log_file: acoustic_camera.log
   log_level: INFO

@@ -94,15 +94,21 @@ logger = logging.getLogger(__name__)
 class BirdNETWorker(QThread):
     """BirdNET analizini arka planda çalıştıran QThread."""
 
-    resultsReady = Signal(list)   # list[dict] — tespit listesi
-    errorOccurred = Signal(str)   # hata mesajı
+    resultsReady = Signal(list)    # list[dict] — tespit listesi
+    errorOccurred = Signal(str)    # hata mesajı
+    classifierReady = Signal(object)  # ilk yüklemeden sonra classifier nesnesi
 
     def __init__(self, audio_np: np.ndarray, sample_rate: int = 48000,
-                 min_confidence: float = 0.1):
+                 min_confidence: float = 0.1, classifier=None,
+                 lat: float = -1, lon: float = -1, include_human: bool = True):
         super().__init__()
         self._audio = audio_np
         self._sr = sample_rate
         self._min_conf = min_confidence
+        self._classifier = classifier  # önbelleklenmiş instance; None ise yeni oluşturulur
+        self._lat = lat   # -1 = lokasyon filtresi kapalı
+        self._lon = lon
+        self._include_human = include_human
 
     def run(self):
         try:
@@ -121,12 +127,19 @@ class BirdNETWorker(QThread):
                 sys.path.insert(0, str(src_dir))
 
             from classification.birdnet import BirdNETClassifier
-            clf = BirdNETClassifier(min_confidence=self._min_conf)
+            is_new = self._classifier is None
+            clf = BirdNETClassifier(min_confidence=self._min_conf) if is_new else self._classifier
             detections = clf.classify_audio(
                 self._audio,
                 sample_rate=self._sr,
                 channel=0,
+                lat=self._lat,
+                lon=self._lon,
+                include_human=self._include_human,
             )
+            if is_new:
+                # İlk yüklemeden sonra ana pencereye geri gönder — sonraki çağrılarda yeniden yüklenmez
+                self.classifierReady.emit(clf)
             self.resultsReady.emit(detections)
         except ModuleNotFoundError as exc:
             self.errorOccurred.emit(
@@ -189,6 +202,7 @@ class AcousticCameraGUI(QMainWindow):
         self.beamforming_counter = 0
         self.beamforming_interval = 1  # Her callback'te beamforming (daha hızlı güncelleme)
         self.latest_heatmap = None  # Cached heatmap for overlay
+        self.latest_overlay_heatmap = None  # Overlay'de gösterilen heatmap (DAS veya seçili mod)
         self.detected_peak = None  # Legacy: single peak (x, y, z, power_db, grid_row, grid_col)
         self.detected_peaks = []  # Multiple peaks list
         self.cached_distances = None  # Precomputed distances for realtime beamforming
@@ -200,6 +214,7 @@ class AcousticCameraGUI(QMainWindow):
         # BirdNET
         self.birdnet_enabled = False
         self.birdnet_worker: Optional[BirdNETWorker] = None
+        self.birdnet_classifier = None  # model bir kez yüklenir, tüm çağrılarda paylaşılır
         self.birdnet_timer = QTimer()
         self.birdnet_timer.timeout.connect(self._trigger_birdnet_analysis)
         self.birdnet_interval_s = 3  # her 3 saniyede bir analiz
@@ -550,24 +565,28 @@ class AcousticCameraGUI(QMainWindow):
         layout.addWidget(QLabel("Algoritma:"))
         self.algorithm_combo = QComboBox()
         self.algorithm_combo.addItems([
-            "DAS (Delay-and-Sum)",
-            "MVDR (Minimum Variance)",
-            "MUSIC",
             "Hybrid (DAS→MUSIC)",
-            "CLEAN-SC"
+            "DAS (Delay-and-Sum)",
+            "MUSIC",
+            "MVDR (Minimum Variance)",
+            "CLEAN-RC (Entegre Değil)",
         ])
+        self.algorithm_combo.setCurrentIndex(0)  # Hybrid varsayılan
         self.algorithm_combo.currentTextChanged.connect(self._on_algorithm_changed)
         self.algorithm_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         layout.addWidget(self.algorithm_combo)
 
         # Number of sources (for MUSIC / Hybrid manual mode)
-        self._n_sources_label = QLabel("Kaynak Sayısı (MUSIC için):")
+        self._n_sources_label = QLabel("Kaynak Sayısı (manuel, auto kapalıysa):")
         layout.addWidget(self._n_sources_label)
         self.n_sources_spin = QSpinBox()
         self.n_sources_spin.setRange(1, 10)
         self.n_sources_spin.setValue(1)
         self.n_sources_spin.setToolTip("MUSIC / Hybrid algoritması için beklenen kaynak sayısı")
         self.n_sources_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        # Hybrid varsayılan + auto=True → spinner başlangıçta devre dışı
+        self.n_sources_spin.setEnabled(False)
+        self.n_sources_spin.setStyleSheet("color: gray;")
         layout.addWidget(self.n_sources_spin)
 
         # ── Hybrid-specific options (hidden by default) ──────────────
@@ -622,7 +641,7 @@ class AcousticCameraGUI(QMainWindow):
         hybrid_layout.addWidget(self.hybrid_method_combo)
 
         self.hybrid_options_widget.setLayout(hybrid_layout)
-        self.hybrid_options_widget.setVisible(False)
+        self.hybrid_options_widget.setVisible(True)  # Hybrid varsayılan algoritma
         layout.addWidget(self.hybrid_options_widget)
         
         # Frekans aralığı - DOUBLE RANGE SLIDER
@@ -814,7 +833,19 @@ class AcousticCameraGUI(QMainWindow):
         alpha_layout.addWidget(self.alpha_slider)
         alpha_layout.addWidget(self.alpha_value_label)
         layout.addLayout(alpha_layout)
-        
+
+        # Overlay kaynağı seçici
+        layout.addWidget(QLabel("Overlay Kaynağı:"))
+        self.overlay_source_combo = QComboBox()
+        self.overlay_source_combo.addItems(["Seçili Mod", "DAS"])
+        self.overlay_source_combo.setToolTip(
+            "Seçili Mod: aktif algoritmanın çıktısını overlay'e yansıt\n"
+            "DAS: her zaman hızlı DAS ısı haritasını arka plan olarak göster\n"
+            "(Hybrid/MUSIC'te peak tespiti etkilenmez — sadece görsel arka plan değişir)"
+        )
+        self.overlay_source_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        layout.addWidget(self.overlay_source_combo)
+
         group.setLayout(layout)
         return group
     
@@ -1115,6 +1146,74 @@ class AcousticCameraGUI(QMainWindow):
         save_btn.clicked.connect(self._save_confirmed_birds)
         layout.addWidget(save_btn)
 
+        # ── Tür Filtresi (Lokasyon / Sezon) ─────────────────────────────
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.HLine)
+        sep2.setStyleSheet("background-color: #3d3d5c; margin-top: 4px;")
+        layout.addWidget(sep2)
+
+        filter_header = QHBoxLayout()
+        filter_header.addWidget(QLabel("Tür Filtresi:"))
+        filter_header.addStretch()
+        self.birdnet_location_filter_cb = QCheckBox("Aktif")
+        self.birdnet_location_filter_cb.setChecked(False)
+        self.birdnet_location_filter_cb.setToolTip(
+            "Aktif edilirse BirdNET yalnızca seçili koordinatta\n"
+            "bu mevsimde görülmesi beklenen türleri döndürür.\n"
+            "Güven skorları ve tespit oranı önemli ölçüde artar."
+        )
+        self.birdnet_location_filter_cb.toggled.connect(self._on_birdnet_location_filter_toggled)
+        filter_header.addWidget(self.birdnet_location_filter_cb)
+        layout.addLayout(filter_header)
+
+        # Enlem / Boylam satırları
+        self.birdnet_filter_widget = QWidget()
+        filter_layout = QVBoxLayout()
+        filter_layout.setContentsMargins(0, 2, 0, 0)
+        filter_layout.setSpacing(4)
+
+        lat_row = QHBoxLayout()
+        lat_row.addWidget(QLabel("Enlem:"))
+        self.birdnet_lat_spin = QDoubleSpinBox()
+        self.birdnet_lat_spin.setRange(-90.0, 90.0)
+        self.birdnet_lat_spin.setDecimals(4)
+        self.birdnet_lat_spin.setSingleStep(0.01)
+        self.birdnet_lat_spin.setValue(41.0082)   # İstanbul varsayılan
+        self.birdnet_lat_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.birdnet_lat_spin.setToolTip("Enlem (WGS84) — İstanbul ≈ 41.0082")
+        lat_row.addWidget(self.birdnet_lat_spin)
+        filter_layout.addLayout(lat_row)
+
+        lon_row = QHBoxLayout()
+        lon_row.addWidget(QLabel("Boylam:"))
+        self.birdnet_lon_spin = QDoubleSpinBox()
+        self.birdnet_lon_spin.setRange(-180.0, 180.0)
+        self.birdnet_lon_spin.setDecimals(4)
+        self.birdnet_lon_spin.setSingleStep(0.01)
+        self.birdnet_lon_spin.setValue(28.9784)   # İstanbul varsayılan
+        self.birdnet_lon_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.birdnet_lon_spin.setToolTip("Boylam (WGS84) — İstanbul ≈ 28.9784")
+        lon_row.addWidget(self.birdnet_lon_spin)
+        filter_layout.addLayout(lon_row)
+
+        self.birdnet_include_human_cb = QCheckBox("İnsan & Gürültü seslerini dahil et")
+        self.birdnet_include_human_cb.setChecked(True)
+        self.birdnet_include_human_cb.setToolTip(
+            "İşaretliyse lokasyon filtresi aktif olsa bile\n"
+            "'Human vocal', 'Human non-vocal', 'Human whistle'\n"
+            "ve 'Noise' etiketleri analizden çıkarılmaz."
+        )
+        filter_layout.addWidget(self.birdnet_include_human_cb)
+
+        self.birdnet_filter_status = QLabel("Filtre kapalı — tüm türler taranır")
+        self.birdnet_filter_status.setStyleSheet("color: #888; font-size: 10px;")
+        self.birdnet_filter_status.setWordWrap(True)
+        filter_layout.addWidget(self.birdnet_filter_status)
+
+        self.birdnet_filter_widget.setLayout(filter_layout)
+        self.birdnet_filter_widget.setEnabled(False)   # Başlangıçta devre dışı
+        layout.addWidget(self.birdnet_filter_widget)
+
         group.setLayout(layout)
         return group
 
@@ -1142,14 +1241,50 @@ class AcousticCameraGUI(QMainWindow):
         if audio_data is None or len(audio_data) == 0:
             return
 
+        # Lokasyon filtresi aktifse koordinatları oku, değilse -1 (kapalı)
+        loc_filter = (
+            hasattr(self, 'birdnet_location_filter_cb') and
+            self.birdnet_location_filter_cb.isChecked()
+        )
+        _lat = self.birdnet_lat_spin.value() if loc_filter else -1
+        _lon = self.birdnet_lon_spin.value() if loc_filter else -1
+        _include_human = (
+            not hasattr(self, 'birdnet_include_human_cb') or
+            self.birdnet_include_human_cb.isChecked()
+        )
+
         self.birdnet_worker = BirdNETWorker(
             audio_np=audio_data,
             sample_rate=48000,
             min_confidence=0.1,
+            classifier=self.birdnet_classifier,  # None ise ilk çağrıda model yüklenir
+            lat=_lat,
+            lon=_lon,
+            include_human=_include_human,
         )
         self.birdnet_worker.resultsReady.connect(self._on_birdnet_results)
         self.birdnet_worker.errorOccurred.connect(self._on_birdnet_error)
+        self.birdnet_worker.classifierReady.connect(self._on_birdnet_classifier_ready)
         self.birdnet_worker.start()
+
+    def _on_birdnet_location_filter_toggled(self, enabled: bool):
+        """Lokasyon filtresi açık/kapalı."""
+        self.birdnet_filter_widget.setEnabled(enabled)
+        if enabled:
+            lat = self.birdnet_lat_spin.value()
+            lon = self.birdnet_lon_spin.value()
+            self.birdnet_filter_status.setText(
+                f"Filtre aktif — {lat:.4f}°N, {lon:.4f}°E\n"
+                "Yalnızca bu bölgeye özgü türler analiz edilir."
+            )
+            self.birdnet_filter_status.setStyleSheet("color: #4caf50; font-size: 10px;")
+        else:
+            self.birdnet_filter_status.setText("Filtre kapalı — tüm türler taranır")
+            self.birdnet_filter_status.setStyleSheet("color: #888; font-size: 10px;")
+
+    def _on_birdnet_classifier_ready(self, clf):
+        """İlk yüklemeden sonra classifier'ı önbellekle — model bir kez yüklenir."""
+        self.birdnet_classifier = clf
 
     def _on_birdnet_results(self, detections: list):
         """BirdNET analiz sonuçlarını her iki listeye yaz."""
@@ -2361,15 +2496,15 @@ class AcousticCameraGUI(QMainWindow):
     
     def _apply_overlay_to_frame(self, frame: np.ndarray) -> np.ndarray:
         """Frame'e overlay uygula (snapshot ve kayıt için)"""
-        if self.latest_heatmap is None:
+        if self.latest_overlay_heatmap is None:
             return frame
-        
+
         try:
             video_h, video_w = frame.shape[:2]
-            
+
             # Heatmap'i video boyutuna ölçekle
             heatmap_resized = cv2.resize(
-                self.latest_heatmap,
+                self.latest_overlay_heatmap,
                 (video_w, video_h),
                 interpolation=cv2.INTER_LINEAR
             )
@@ -2602,6 +2737,7 @@ class AcousticCameraGUI(QMainWindow):
 
         is_music  = algorithm_name == "MUSIC"
         is_hybrid = "Hybrid" in algorithm_name
+        is_das    = algorithm_name.startswith("DAS")
 
         # Hybrid panel görünürlüğü
         self.hybrid_options_widget.setVisible(is_hybrid)
@@ -2620,6 +2756,18 @@ class AcousticCameraGUI(QMainWindow):
             self.n_sources_spin.setEnabled(False)
             self.n_sources_spin.setStyleSheet("color: gray;")
             self._n_sources_label.setText("Kaynak Sayısı (MUSIC için):")
+
+        # Overlay source combo: DAS seçeneği yalnızca DAS dışı algoritmalarda anlamlı
+        if hasattr(self, 'overlay_source_combo'):
+            self.overlay_source_combo.setEnabled(not is_das)
+            if is_das:
+                self.overlay_source_combo.setCurrentIndex(0)  # "Seçili Mod"
+
+        # CLEAN-RC henüz entegre değil — uyarı göster, diğer algoritmalarda temizle
+        if "CLEAN-RC" in algorithm_name:
+            self.statusbar.showMessage("⚠ CLEAN-RC henüz entegre değil — DAS ile devam ediliyor")
+        else:
+            self.statusbar.clearMessage()
 
     def _on_hybrid_auto_sources_changed(self, state):
         """Hybrid modda otomatik kaynak sayısı toggle"""
@@ -2641,6 +2789,7 @@ class AcousticCameraGUI(QMainWindow):
         else:
             # Clear overlay when disabled
             self.latest_heatmap = None
+            self.latest_overlay_heatmap = None
             self.statusbar.showMessage("Beamforming devre dışı")
     
     def load_audio_file(self):
@@ -3021,7 +3170,22 @@ class AcousticCameraGUI(QMainWindow):
             
             # Convert to heatmap (RGB image)
             self.latest_heatmap = self._power_to_heatmap(power_grid)
-            
+
+            # Overlay kaynağını belirle (seçili mod veya DAS)
+            overlay_src = (self.overlay_source_combo.currentText()
+                           if hasattr(self, 'overlay_source_combo') else "Seçili Mod")
+            if overlay_src == "DAS" and not algorithm.startswith("DAS"):
+                # DAS'ı ayrıca hesapla ve overlay olarak kullan
+                _das_ov = das_beamformer_realtime(
+                    audio_data, self.mic_positions, self.grid_points, sample_rate,
+                    self.beamforming_config, max_freq_bins=self.max_freq_bins,
+                    distances=self.cached_distances,
+                )
+                _das_ov_db = power_to_db(_das_ov, spl_offset=self._get_spl_offset())
+                self.latest_overlay_heatmap = self._power_to_heatmap(_das_ov_db.reshape(self.grid_shape))
+            else:
+                self.latest_overlay_heatmap = self.latest_heatmap
+
             # Update overlay on video
             self._update_video_overlay()
             
@@ -3430,7 +3594,7 @@ class AcousticCameraGUI(QMainWindow):
         """Update video frame with acoustic heatmap overlay - HUD Style"""
         try:
             # Check if we have video and heatmap
-            if self.video_capture is None or self.latest_heatmap is None:
+            if self.video_capture is None or self.latest_overlay_heatmap is None:
                 return
             
             # Capture video frame
@@ -3449,7 +3613,7 @@ class AcousticCameraGUI(QMainWindow):
                 self._display_image(frame)
                 return
             
-            heatmap_h, heatmap_w = self.latest_heatmap.shape[:2]
+            heatmap_h, heatmap_w = self.latest_overlay_heatmap.shape[:2]
             
             # ============================================================
             # STRATEGY: FULL SCREEN OVERLAY (stretch to entire video)
@@ -3465,7 +3629,7 @@ class AcousticCameraGUI(QMainWindow):
             
             # Resize heatmap to overlay dimensions
             heatmap_resized = cv2.resize(
-                self.latest_heatmap,
+                self.latest_overlay_heatmap,
                 (overlay_w, overlay_h),
                 interpolation=cv2.INTER_LINEAR
             )
