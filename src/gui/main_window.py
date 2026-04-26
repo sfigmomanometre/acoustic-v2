@@ -3121,7 +3121,7 @@ class AcousticCameraGUI(QMainWindow):
                     self.grid_points,
                     sample_rate,
                     self.beamforming_config,
-                    diagonal_loading=1e-3,
+                    diagonal_loading=1e-6,
                     max_freq_bins=self.max_freq_bins,
                     distances=self.cached_distances
                 )

@@ -1109,7 +1109,7 @@ def mvdr_beamformer_realtime(
     sample_rate: float,
     config: BeamformingConfig,
     freq_range: Optional[Tuple[float, float]] = None,
-    diagonal_loading: float = 1e-3,
+    diagonal_loading: float = 1e-6,
     max_freq_bins: int = 10,
     distances: Optional[np.ndarray] = None
 ) -> np.ndarray:
@@ -1175,9 +1175,14 @@ def mvdr_beamformer_realtime(
         
         valid_mask = denominator > 1e-10
         power_map[valid_mask] += 1.0 / denominator[valid_mask]
-    
+
     power_map /= n_freqs
-    
+    # The MVDR denominator a^H R^{-1} a contains a 1/diagonal_loading factor
+    # that is absent from the MUSIC denominator ||E_n^H a||^2.  Dividing by
+    # diagonal_loading cancels this asymmetry and brings MVDR output to the
+    # same absolute scale as MUSIC and DAS.
+    power_map /= diagonal_loading
+
     return power_map
 
 

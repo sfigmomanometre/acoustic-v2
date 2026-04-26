@@ -51,6 +51,7 @@ from src.evaluation.metrics import (
     peak_to_xyz,
     snr_improvement,
     measure_pipeline_latency,
+    measure_birdnet_latency,
     batch_evaluate,
 )
 
@@ -100,11 +101,13 @@ def run_hybrid(chunk, mic_positions, grid_points, sample_rate, config,
     """
     try:
         from src.algorithms.beamforming import hybrid_beamformer_realtime
-        return hybrid_beamformer_realtime(
+        result = hybrid_beamformer_realtime(
             chunk, mic_positions, grid_points, sample_rate, config,
             max_freq_bins=max_freq_bins, distances=distances,
             roi_threshold_db=roi_threshold_db,
         )
+        # hybrid_beamformer_realtime returns (full_power, n_sources_used, roi_mask)
+        return result[0] if isinstance(result, tuple) else result
     except (ImportError, TypeError):
         # Hybrid yoksa DAS ile devam et
         return das_beamformer_realtime(
@@ -132,6 +135,109 @@ def print_results_table(results: dict, spl_offset: float):
     print("=" * 70)
 
 
+def print_birdnet_table(birdnet_result: dict):
+    """BirdNET gecikme sonuçlarını ASCII tablo olarak yazdır."""
+    m = birdnet_result
+    print("\n" + "=" * 70)
+    print("  BirdNET İŞLEM HIZI")
+    print("=" * 70)
+    print(f"  {'Gecikme/chunk':<20} {m['mean_ms']:>7.1f} ± {m['std_ms']:.1f} ms")
+    print(f"  {'Min / Maks':<20} {m['min_ms']:>7.1f} / {m['max_ms']:.1f} ms")
+    print(f"  {'RTF':<20} {m['rtf']:>7.4f}  (1.0 = gerçek-zamanlı)")
+    print(f"  {'Throughput':<20} {m['throughput_x']:>7.1f}× gerçek zamanlıdan hızlı")
+    print(f"  {'Analiz edilen':<20} {m['chunks_analyzed']:>7} chunk "
+          f"({m['audio_duration_s']:.1f}s ses)")
+    print(f"  {'Toplam işlem':<20} {m['total_processing_s']:>7.2f} s")
+    print("=" * 70)
+
+
+def _render_power_map_ax(
+    ax,
+    x_vals: np.ndarray,
+    y_vals: np.ndarray,
+    power_db: np.ndarray,
+    title: str,
+    spl_offset: float,
+    dynamic_range: float = 15.0,
+    cmap: str = "hot_r",
+    contour_levels_db: tuple = (-12, -9, -6, -3),
+    fontsize: int = 10,
+    normalize_to_peak: bool = False,
+):
+    """
+    Tek eksene konturlu güç haritası çiz.
+
+    normalize_to_peak=True ise colorbar'ı her panel kendi peak'ine göre
+    gösterir (0 dB = peak, −N dB = background). Bu seçenek MVDR/MUSIC gibi
+    dar demet algoritmalarının zıtlığını ortaya çıkarır.
+
+    Siyah-beyaz baskıya uyum için:
+    - 'hot_r' colormap (karanlıktan açığa — B&W'da parlaklık degradesi)
+    - Siyah kontur çizgileri (belirli dB seviyeleri)
+    - Kontur etiketleri
+    """
+    import matplotlib.pyplot as plt
+
+    v_max = float(power_db.max())
+    v_min = v_max - dynamic_range
+
+    # normalize_to_peak=True → haritayı [−dynamic_range, 0] aralığına kaydır
+    if normalize_to_peak:
+        plot_data = power_db - v_max          # peak = 0 dB, arka plan < 0
+        pv_max = 0.0
+        pv_min = -dynamic_range
+        abs_levels = sorted([d for d in contour_levels_db if d > pv_min])
+        cb_label = "dB (peak-normalized)"
+    else:
+        plot_data = power_db
+        pv_max = v_max
+        pv_min = v_min
+        abs_levels = sorted([v_max + d for d in contour_levels_db if v_max + d > v_min])
+        cb_label = "dBSPL" if spl_offset > 0 else "dBFS"
+
+    # Arka plan: doldurulmuş renk haritası
+    im = ax.pcolormesh(
+        x_vals, y_vals, plot_data,
+        cmap=cmap,
+        vmin=pv_min,
+        vmax=pv_max,
+        shading="auto",
+    )
+
+    # Kontur seviyeleri (her iki mod için aynı göreli dB mantığı)
+    if abs_levels:
+        cs = ax.contour(
+            x_vals, y_vals, plot_data,
+            levels=abs_levels,
+            colors="black",
+            linewidths=0.8,
+            linestyles=["--", "-.", "-", "-"],
+        )
+        if normalize_to_peak:
+            fmt = {lv: f"{lv:+.0f} dB" for lv in abs_levels}
+        else:
+            fmt = {lv: f"{lv - v_max:+.0f} dB" for lv in abs_levels}
+        ax.clabel(cs, fmt=fmt, fontsize=fontsize - 2, inline=True, inline_spacing=2)
+
+    # Tepe noktasını işaretle
+    peak_idx = np.unravel_index(np.argmax(plot_data), plot_data.shape)
+    ax.plot(
+        x_vals[peak_idx], y_vals[peak_idx],
+        marker="+", color="black", markersize=10, markeredgewidth=1.5,
+    )
+
+    cb = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cb.set_label(cb_label, fontsize=fontsize - 1)
+    cb.ax.tick_params(labelsize=fontsize - 2)
+
+    ax.set_title(title, fontsize=fontsize + 1, fontweight="bold")
+    ax.set_xlabel("X (m)", fontsize=fontsize)
+    ax.set_ylabel("Y (m)", fontsize=fontsize)
+    ax.tick_params(labelsize=fontsize - 1)
+    ax.set_aspect("equal")
+    ax.grid(True, linewidth=0.3, alpha=0.4, color="gray")
+
+
 def save_power_maps(
     wav_path: Path,
     mic_positions: np.ndarray,
@@ -145,15 +251,36 @@ def save_power_maps(
     output_dir: Path,
     chunk_duration: float = 0.5,
 ):
-    """Her algoritma için ilk chunk'ın güç haritasını PNG olarak kaydet."""
+    """
+    Her algoritma için ilk chunk'ın güç haritasını kaydet.
+
+    Üretilen dosyalar:
+      power_maps_<stem>.png          — 2×2 (veya 1×N) karşılaştırma figürü
+      power_map_<stem>_<ALG>.png     — Her algoritma için ayrı yüksek çözünürlüklü figür
+
+    Her figür B&W baskıya uyumlu:
+      - hot_r colormap (parlaklık degradesi B&W'da korunur)
+      - Siyah kontur çizgileri (−3/−6/−9/−12 dB)
+      - Kontur etiketleri
+      - Peak konumu işaretli (+)
+    """
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        import matplotlib.ticker as ticker
         import soundfile as sf
     except ImportError:
         logger.warning("matplotlib veya soundfile yok — figürler kaydedilmedi.")
         return
+
+    plt.rcParams.update({
+        "font.family": "serif",
+        "font.size": 10,
+        "axes.linewidth": 0.8,
+        "xtick.direction": "in",
+        "ytick.direction": "in",
+    })
 
     audio, sr = sf.read(str(wav_path), always_2d=True)
     audio = audio[:, :mic_positions.shape[0]]
@@ -179,39 +306,73 @@ def save_power_maps(
             c, mic_positions, grid_points, sr, config, distances, max_freq_bins),
     }
 
-    n_algs = len(algorithms)
-    fig, axes = plt.subplots(1, n_algs, figsize=(5 * n_algs, 5))
-    if n_algs == 1:
-        axes = [axes]
-
     x_vals = grid_points[:, 0].reshape(grid_shape)
     y_vals = grid_points[:, 1].reshape(grid_shape)
 
-    for ax, alg in zip(axes, algorithms):
-        if alg not in fn_map:
-            continue
-        power_map = fn_map[alg](chunk)
-        power_db = power_to_db(power_map, spl_offset=spl_offset).reshape(grid_shape)
+    # Tüm algoritmaların güç haritalarını hesapla (bir kez)
+    power_maps = {}
+    for alg in algorithms:
+        if alg in fn_map:
+            pm = fn_map[alg](chunk)
+            power_maps[alg] = power_to_db(pm, spl_offset=spl_offset).reshape(grid_shape)
 
-        im = ax.pcolormesh(
-            x_vals, y_vals, power_db,
-            cmap="jet",
-            vmin=power_db.max() - 15,
-            vmax=power_db.max(),
+    valid_algs = [a for a in algorithms if a in power_maps]
+    if not valid_algs:
+        logger.warning("Hiçbir algoritma hesaplanamadı.")
+        return
+
+    # --- 1. Karşılaştırma figürü (2×2 veya 1×N) ---
+    n = len(valid_algs)
+    if n <= 2:
+        nrows, ncols = 1, n
+    else:
+        nrows, ncols = 2, 2
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4.5 * ncols, 4.0 * nrows),
+                             squeeze=False)
+    axes_flat = axes.flatten()
+
+    # DAS: geniş demet → 15 dB dinamik aralık, mutlak dBSPL göster
+    # MVDR/MUSIC/Hybrid: dar demet → 6 dB dinamik aralık, peak'e normalize et
+    _NARROW_BEAM_ALGS = {"MVDR", "MUSIC", "Hybrid"}
+
+    for i, alg in enumerate(valid_algs):
+        is_narrow = alg in _NARROW_BEAM_ALGS
+        _render_power_map_ax(
+            axes_flat[i], x_vals, y_vals, power_maps[alg],
+            title=alg, spl_offset=spl_offset, fontsize=10,
+            dynamic_range=6.0 if is_narrow else 15.0,
+            normalize_to_peak=is_narrow,
         )
-        plt.colorbar(im, ax=ax, label="dBSPL" if spl_offset > 0 else "dBFS")
-        ax.set_title(alg)
-        ax.set_xlabel("X (m)")
-        ax.set_ylabel("Y (m)")
-        ax.set_aspect("equal")
+    # Boş panelleri gizle (örn. 3 algoritma → 4. panel boş)
+    for j in range(len(valid_algs), len(axes_flat)):
+        axes_flat[j].set_visible(False)
 
-    plt.suptitle(f"Güç Haritaları — {wav_path.name}", y=1.02)
+    fig.suptitle(f"Beamforming Güç Haritaları — {wav_path.stem}",
+                 fontsize=11, fontweight="bold", y=1.01)
     plt.tight_layout()
 
-    fig_path = output_dir / f"power_maps_{wav_path.stem}.png"
-    plt.savefig(fig_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    logger.info(f"Figür kaydedildi: {fig_path}")
+    comparison_path = output_dir / f"power_maps_{wav_path.stem}.png"
+    fig.savefig(comparison_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"Karşılaştırma figürü kaydedildi: {comparison_path}")
+
+    # --- 2. Her algoritma için ayrı yüksek çözünürlüklü figür ---
+    for alg in valid_algs:
+        is_narrow = alg in _NARROW_BEAM_ALGS
+        fig_s, ax_s = plt.subplots(1, 1, figsize=(4.5, 4.0))
+        _render_power_map_ax(
+            ax_s, x_vals, y_vals, power_maps[alg],
+            title=alg, spl_offset=spl_offset, fontsize=11,
+            dynamic_range=6.0 if is_narrow else 15.0,
+            normalize_to_peak=is_narrow,
+        )
+        plt.tight_layout()
+        alg_slug = alg.lower().replace(" ", "_").replace("(", "").replace(")", "").replace("→", "")
+        single_path = output_dir / f"power_map_{wav_path.stem}_{alg_slug}.png"
+        fig_s.savefig(single_path, dpi=300, bbox_inches="tight")
+        plt.close(fig_s)
+        logger.info(f"  {alg} figürü kaydedildi: {single_path}")
 
 
 def main():
@@ -258,6 +419,22 @@ def main():
         "--no-figures", action="store_true",
         help="Figür üretimini atla",
     )
+    parser.add_argument(
+        "--figures-only", action="store_true",
+        help="Sadece figür üret: metrik hesaplama ve JSON kayıt atlanır",
+    )
+    parser.add_argument(
+        "--birdnet", action="store_true",
+        help="BirdNET işlem hızını da ölç ve rapora ekle",
+    )
+    parser.add_argument(
+        "--birdnet-channel", type=int, default=0,
+        help="BirdNET analizi için kullanılacak WAV kanalı (varsayılan: 0)",
+    )
+    parser.add_argument(
+        "--birdnet-max-chunks", type=int, default=None,
+        help="BirdNET için maksimum chunk sayısı (varsayılan: tüm kayıt)",
+    )
     args = parser.parse_args()
 
     # --- Yolları çöz ---
@@ -297,6 +474,26 @@ def main():
     if args.ground_truth:
         ground_truth = np.array(args.ground_truth, dtype=float)
         logger.info(f"Ground truth: {ground_truth}")
+
+    # --- Sadece figür modu ---
+    if args.figures_only:
+        if args.no_figures:
+            logger.warning("--figures-only ve --no-figures aynı anda kullanıldı; figürler üretilmeyecek.")
+            return {}
+        save_power_maps(
+            wav_path=wav_path,
+            mic_positions=mic_positions,
+            grid_points=grid_points,
+            grid_shape=grid_shape,
+            config=bf_config,
+            algorithms=args.algorithms,
+            sample_rate=sample_rate,
+            spl_offset=spl_offset,
+            max_freq_bins=args.max_freq_bins,
+            output_dir=output_dir,
+            chunk_duration=args.chunk_duration,
+        )
+        return {}
 
     # --- Batch değerlendirme (Hybrid özel işlem gerektirir) ---
     algs_for_batch = [a for a in args.algorithms if a != "Hybrid"]
@@ -364,6 +561,23 @@ def main():
 
     # --- Tablo ---
     print_results_table(results, spl_offset)
+
+    # --- BirdNET hız ölçümü ---
+    if args.birdnet:
+        logger.info("BirdNET işlem hızı ölçülüyor...")
+        try:
+            birdnet_result = measure_birdnet_latency(
+                wav_path=str(wav_path),
+                sample_rate=sample_rate,
+                chunk_duration=3.0,
+                channel=args.birdnet_channel,
+                n_warmup=1,
+                max_chunks=args.birdnet_max_chunks,
+            )
+            print_birdnet_table(birdnet_result)
+            results["BirdNET"] = birdnet_result
+        except Exception as exc:
+            logger.warning(f"BirdNET ölçümü başarısız: {exc}")
 
     # --- JSON kaydet ---
     json_path = output_dir / f"results_{wav_path.stem}.json"

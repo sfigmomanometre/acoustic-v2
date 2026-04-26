@@ -1,7 +1,8 @@
 """
 Akustik Kamera Değerlendirme Metrikleri
 
-Lokalizasyon doğruluğu, SNR kazancı ve pipeline gecikmesi ölçümleri.
+Lokalizasyon doğruluğu, SNR kazancı, pipeline gecikmesi ve
+BirdNET işlem hızı ölçümleri.
 AES paper'ı için kullanılacak sayısal sonuçlar üretir.
 """
 
@@ -326,3 +327,102 @@ def batch_evaluate(
                        if angular_errors else ""))
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# BirdNET işlem hızı ölçümü
+# ---------------------------------------------------------------------------
+
+def measure_birdnet_latency(
+    wav_path: str,
+    sample_rate: int = 48000,
+    chunk_duration: float = 3.0,
+    channel: int = 0,
+    n_warmup: int = 1,
+    max_chunks: Optional[int] = None,
+    min_confidence: float = 0.1,
+) -> Dict[str, float]:
+    """
+    BirdNET sınıflandırıcının işlem süresi (gecikme) ölçümü.
+
+    BirdNET, sesi 3 saniyelik pencerelerde analiz eder.
+    Bu fonksiyon gerçek WAV chunk'ları üzerinde ölçüm yapar.
+
+    Args:
+        wav_path:       WAV dosyası yolu (tek veya çok kanallı)
+        sample_rate:    Beklenen örnekleme hızı
+        chunk_duration: BirdNET analiz penceresi (saniye; 3.0 önerilir)
+        channel:        Çok kanallı WAV için kanal indeksi (0 = ilk mikrofon)
+        n_warmup:       İlk N chunk modeli ısıtmak için kullanılır (süre ölçülmez)
+        max_chunks:     En fazla kaç chunk analiz edilsin (None = tümü)
+        min_confidence: BirdNET minimum güven eşiği
+
+    Returns:
+        {
+          "mean_ms":            Ortalama chunk gecikme (ms),
+          "std_ms":             Standart sapma (ms),
+          "min_ms":             Minimum gecikme (ms),
+          "max_ms":             Maksimum gecikme (ms),
+          "rtf":                Gerçek-zaman faktörü — processing_time / audio_time
+                                (< 1 = gerçek zamanlıdan hızlı),
+          "throughput_x":       1 / RTF  (kaç kat gerçek zamanlıdan hızlı),
+          "chunks_analyzed":    Ölçülen chunk sayısı,
+          "audio_duration_s":   Ölçülen ses süresi toplamı (saniye),
+          "total_processing_s": Toplam işlem süresi (saniye),
+        }
+    """
+    import soundfile as sf
+    from src.classification.birdnet import BirdNETClassifier
+
+    audio, sr = sf.read(wav_path, always_2d=True)
+    if audio.shape[1] <= channel:
+        raise ValueError(
+            f"WAV dosyasında kanal {channel} yok (toplam {audio.shape[1]} kanal)."
+        )
+    mono = audio[:, channel].astype(np.float32)
+
+    chunk_samples = int(chunk_duration * sr)
+    n_total = len(mono) // chunk_samples
+    if n_total == 0:
+        raise ValueError(
+            f"WAV çok kısa: {len(mono)/sr:.2f}s < {chunk_duration}s chunk süresi."
+        )
+
+    if max_chunks is not None:
+        n_total = min(n_total, n_warmup + max_chunks)
+
+    clf = BirdNETClassifier(min_confidence=min_confidence)
+
+    # Isınma: model yüklensin, JIT derleme gerçekleşsin
+    for i in range(min(n_warmup, n_total)):
+        chunk = mono[i * chunk_samples: (i + 1) * chunk_samples]
+        clf.classify_audio(chunk, sample_rate=sr)
+
+    if n_total <= n_warmup:
+        raise ValueError(
+            f"Ölçüm için yeterli chunk yok (n_warmup={n_warmup}, n_total={n_total})."
+        )
+
+    times_ms = []
+    for i in range(n_warmup, n_total):
+        chunk = mono[i * chunk_samples: (i + 1) * chunk_samples]
+        t0 = time.perf_counter()
+        clf.classify_audio(chunk, sample_rate=sr)
+        times_ms.append((time.perf_counter() - t0) * 1000.0)
+
+    times_arr = np.array(times_ms)
+    audio_duration_s = len(times_ms) * chunk_duration
+    total_processing_s = float(np.sum(times_arr)) / 1000.0
+    rtf = total_processing_s / audio_duration_s
+
+    return {
+        "mean_ms":            float(np.mean(times_arr)),
+        "std_ms":             float(np.std(times_arr)),
+        "min_ms":             float(np.min(times_arr)),
+        "max_ms":             float(np.max(times_arr)),
+        "rtf":                rtf,
+        "throughput_x":       (1.0 / rtf) if rtf > 0 else float("inf"),
+        "chunks_analyzed":    len(times_ms),
+        "audio_duration_s":   audio_duration_s,
+        "total_processing_s": total_processing_s,
+    }

@@ -47,3 +47,5 @@ temp/
 /docs
 /data/bird_detections
 /data/snapshots
+/results
+/data
